@@ -29,8 +29,8 @@ MAGNET_PIN = 23
 PWM_FREQUENCY = 1000  # 1kHz PWM
 
 # Audio config for music analysis
-AUDIO_DEVICE = 'plughw:2,1'  # Direct loopback capture
-SAMPLE_RATE = 44100
+AUDIO_DEVICE = "plughw:2,1"
+SAMPLE_RATE = 48000  # Match Raspotify
 CHUNK_SIZE = 1024
 
 # Electromagnet pattern parameters
@@ -77,6 +77,7 @@ class OracleLEDController:
 
         # Audio capture for music reactivity
         self.audio_stream = None
+        self.speaker_stream = None  # Speaker passthrough
 
         # TTS audio level (for SPEAKING mode)
         self.tts_audio_level = 0.0
@@ -259,6 +260,18 @@ class OracleLEDController:
                 periodsize=CHUNK_SIZE
             )
             print("   ✓ Audio capture initialized")
+
+            # Open speaker output for passthrough
+            self.speaker_stream = alsaaudio.PCM(
+                alsaaudio.PCM_PLAYBACK,
+                alsaaudio.PCM_NORMAL,
+                device='hw:4,0',
+                channels=2,
+                rate=SAMPLE_RATE,
+                format=alsaaudio.PCM_FORMAT_S16_LE,
+                periodsize=CHUNK_SIZE
+            )
+            print("   ✓ Speaker passthrough initialized")
         except Exception as e:
             print(f"   ✗ Failed to open audio: {e}")
             print("   Falling back to demo mode...")
@@ -274,6 +287,10 @@ class OracleLEDController:
                 length, data = self.audio_stream.read()
 
                 if length > 0:
+                    # Pass audio through to speakers
+                    if self.speaker_stream:
+                        self.speaker_stream.write(data)
+
                     # Convert stereo to mono
                     audio = struct.unpack(f'{length * 2}h', data)
                     mono = np.array([int((audio[i] + audio[i+1]) / 2) for i in range(0, len(audio), 2)])
