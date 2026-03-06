@@ -30,7 +30,7 @@ PWM_FREQUENCY = 1000  # 1kHz PWM
 
 # Audio config for music analysis
 AUDIO_DEVICE = "plughw:2,1"
-SAMPLE_RATE = 48000  # Match Raspotify
+SAMPLE_RATE = 44100  # Match Raspotify actual output
 CHUNK_SIZE = 1024
 
 # Electromagnet pattern parameters

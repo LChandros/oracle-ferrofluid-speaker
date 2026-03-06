@@ -9,9 +9,9 @@ import time
 
 LOOPBACK_DEVICE = "plughw:2,1"
 SPEAKER_DEVICE = "plughw:4,0"
-SAMPLE_RATE = 48000  # Match Raspotify
+SAMPLE_RATE = 44100  # Match Raspotify actual output
 CHANNELS = 2
-CHUNK_SIZE = 1024
+CHUNK_SIZE = 2048  # Larger chunks for smoother streaming
 
 print("Oracle Audio Bridge starting...")
 print(f"  Input: {LOOPBACK_DEVICE}")
