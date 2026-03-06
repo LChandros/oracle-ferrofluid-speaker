@@ -1,0 +1,24 @@
+[Unit]
+Description=Oracle Scheduler Service
+Documentation=https://github.com/LChandros/moneo
+After=network.target
+Wants=oracle-master.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/tyahn
+ExecStart=/usr/bin/python3 /home/tyahn/oracle_scheduler.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oracle-scheduler
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,90 @@
+========================================
+FERROFLUID SPEAKER - GROUND LOOP ISOLATOR SETUP
+Single Breadboard Power Configuration
+========================================
+
+EQUIPMENT NEEDED:
+- Ground loop isolator (BESIGN)
+- Two 3.5mm aux cables (male-to-male)
+- External 5V power supply
+- Breadboard with power rails
+
+========================================
+POWER CONNECTIONS (Single Breadboard):
+========================================
+
+Breadboard 5V+ rail:
+  ├─→ Raspberry Pi 5V (via GPIO or USB)
+  └─→ DROK Amplifier VIN
+
+Breadboard GND rail:
+  ├─→ Raspberry Pi GND (GPIO pin)
+  └─→ DROK Amplifier GND
+
+External 5V Supply:
+  ├─→ Breadboard 5V+ rail
+  └─→ Breadboard GND rail
+
+========================================
+AUDIO SIGNAL PATH (WITH GROUND LOOP ISOLATOR):
+========================================
+
+ReSpeaker HAT 3.5mm jack
+    │
+    └─→ [3.5mm Aux Cable #1]
+            │
+            ▼
+        GROUND LOOP ISOLATOR INPUT
+            │
+        [Isolator breaks ground loop]
+            │
+            ▼
+        GROUND LOOP ISOLATOR OUTPUT
+            │
+            └─→ [3.5mm Aux Cable #2]
+                    │
+                    ▼
+                DROK Amplifier INPUT
+                    │
+                    └─→ Speaker terminals
+                            │
+                            ▼
+                        78mm 8Ω Speakers
+
+========================================
+GROUND LOOP ISOLATOR PLACEMENT:
+========================================
+
+Physical location: Between ReSpeaker and DROK amp
+Purpose: Breaks electrical ground connection while passing audio signal
+Result: Eliminates hum/static caused by shared power ground
+
+========================================
+VERIFICATION STEPS:
+========================================
+
+1. Power everything from breadboard 5V rail
+2. Connect audio: ReSpeaker → Isolator → DROK → Speakers
+3. Test with: speaker-test -D plughw:3,0 -c 2 -t wav -l 2
+4. Listen for clean audio (no hum/static)
+5. If still noisy, check isolator orientation (some have input/output marked)
+
+========================================
+ALSA MIXER SETTINGS (Already configured):
+========================================
+
+amixer -c 3 sset Headphone 127          # 100%
+amixer -c 3 sset Playback 255           # 100%
+amixer -c 3 sset 'Left Output Mixer PCM' on
+amixer -c 3 sset 'Right Output Mixer PCM' on
+
+========================================
+NOTES:
+========================================
+
+- Ground loop isolator uses transformer coupling (magnetic, not electrical)
+- Audio quality should be same as before (isolator is transparent)
+- You can now use single power supply for entire system
+- Settings saved with: sudo alsactl store 3
+
+Created: Sun Jan 18 21:06:33 UTC 2026

@@ -1,0 +1,26 @@
+[Unit]
+Description=Oracle Master Service - Unified Voice Assistant + Music Visualizer
+After=network.target sound.target alsa-restore.service
+Wants=raspotify.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/tyahn
+ExecStart=/usr/bin/python3 /home/tyahn/oracle_master_service.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+Environment="HOME=/home/tyahn"
+
+# Resource limits
+Nice=-5
+CPUWeight=200
+
+[Install]
+WantedBy=multi-user.target

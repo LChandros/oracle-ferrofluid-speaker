@@ -1,0 +1,76 @@
+========================================
+IRF520 MOSFET MODULE WIRING
+Current Setup on Breadboard
+========================================
+
+MOSFET MODULE (Rows 20-23):
+Row 23: SIG   ← GPIO 21 (Pin 40) signal wire
+Row 22: V+    ← Electromagnet positive wire
+Row 21: V-    ← Electromagnet negative wire
+Row 20: GND   ← Breadboard GND rail
+
+POWER RAILS:
+5V+ rail → (needs to connect somewhere to power electromagnet)
+GND rail → Row 20 (MOSFET GND)
+
+========================================
+WHERE CAPACITORS GO:
+========================================
+
+The capacitors need to go across the ELECTROMAGNET power,
+which is on the OUTPUT side of the MOSFET:
+
+Row 22 (V+) ──┬── Electromagnet coil positive
+              ├── [470μF +] positive leg
+              └── [104] one leg
+
+Row 21 (V-) ──┬── Electromagnet coil negative
+              ├── [470μF -] negative leg (stripe side)
+              └── [104] other leg
+
+========================================
+STEP BY STEP:
+========================================
+
+1. Identify MOSFET module terminals:
+   - Row 23: SIG (control signal from Pi)
+   - Row 22: V+ (electromagnet positive out)
+   - Row 21: V- (electromagnet negative out)
+   - Row 20: GND (MOSFET ground reference)
+
+2. Insert 470μF capacitor:
+   - Positive leg (+) in Row 22
+   - Negative leg (-) in Row 21
+
+3. Insert 104 ceramic capacitor:
+   - One leg in Row 22
+   - Other leg in Row 21
+
+4. Check polarity on 470μF:
+   - Longer leg = positive = Row 22
+   - Stripe on side = negative side = Row 21
+
+========================================
+WHAT ABOUT POWER SUPPLY?
+========================================
+
+You still need to connect power TO the MOSFET module:
+- 5V+ rail → V+ screw terminal on MOSFET module
+- This powers the electromagnet through the MOSFET
+
+Complete wiring:
+5V+ rail → MOSFET V+ terminal → [MOSFET switches] → Row 22 → Electromagnet
+Electromagnet → Row 21 → MOSFET V- terminal → Row 20 → GND rail
+
+========================================
+FINAL CHECK:
+========================================
+
+After adding capacitors, you should have:
+Row 22: V+ output with TWO capacitor legs
+Row 21: V- output with TWO capacitor legs
+
+This puts capacitors right at the electromagnet,
+where they can absorb switching noise.
+
+========================================

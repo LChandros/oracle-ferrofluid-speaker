@@ -1,0 +1,1 @@
+Audio broken after electromagnet test - only hearing pops. Check: 1) Ground loop isolator cables 2) DROK amp connections 3) Speaker wires. MOSFET unplugged, issue persists. Capacitors wired: 470uF + 104 ceramic across electromagnet.

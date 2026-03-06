@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Oracle Ferrofluid Speaker</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #fff;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        .subtitle {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        textarea, input, select {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            background: rgba(255, 255, 255, 0.9);
+            color: #333;
+        }
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+            font-family: inherit;
+        }
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            width: 100%;
+            font-weight: 600;
+        }
+        button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        button.recording {
+            background: linear-gradient(135deg, #f44336 0%, #e91e63 100%);
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+        }
+        .status.success {
+            background: rgba(76, 175, 80, 0.3);
+            border: 1px solid rgba(76, 175, 80, 0.5);
+            display: block;
+        }
+        .status.error {
+            background: rgba(244, 67, 54, 0.3);
+            border: 1px solid rgba(244, 67, 54, 0.5);
+            display: block;
+        }
+        .status.playing, .status.recording {
+            background: rgba(33, 150, 243, 0.3);
+            border: 1px solid rgba(33, 150, 243, 0.5);
+            display: block;
+        }
+        .config-section {
+            margin-top: 10px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .quick-phrases {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+        .quick-phrase {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .quick-phrase:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(1.05);
+        }
+        .voice-section {
+            margin-top: 30px;
+            padding-top: 30px;
+            border-top: 2px solid rgba(255, 255, 255, 0.3);
+        }
+        #conversation {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            padding: 15px;
+            min-height: 200px;
+            max-height: 400px;
+            overflow-y: auto;
+            margin-bottom: 20px;
+        }
+        .message {
+            margin-bottom: 15px;
+            padding: 10px;
+            border-radius: 8px;
+        }
+        .message.user {
+            background: rgba(102, 126, 234, 0.3);
+            text-align: right;
+        }
+        .message.assistant {
+            background: rgba(118, 75, 162, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎵 Oracle Ferrofluid Speaker</h1>
+            <div class="subtitle">Voice Assistant with LED & Electromagnet Visualization</div>
+        </div>
+
+        {% if not api_key_configured %}
+        <div class="card">
+            <h2>⚙️ Configuration Required</h2>
+            <div class="form-group">
+                <label for="apiKey">ElevenLabs API Key:</label>
+                <input type="password" id="apiKey" placeholder="Enter your ElevenLabs API key">
+            </div>
+            <button onclick="saveApiKey()">Save API Key</button>
+        </div>
+        {% endif %}
+
+        <!-- Voice Conversation Section -->
+        <div class="card">
+            <h2>🗣️ Talk to Moneo</h2>
+            <p style="margin-bottom: 20px; opacity: 0.9;">Click the button and speak your question. Moneo will respond with voice and visualization.</p>
+
+            <div id="conversation"></div>
+
+            <button id="voiceBtn" onclick="toggleVoiceRecording()">🎤 Hold to Talk</button>
+            <div id="voiceStatus" class="status"></div>
+
+            <div class="voice-section">
+                <div class="form-group">
+                    <label for="voiceSelectVoice">Voice for responses:</label>
+                    <select id="voiceSelectVoice">
+                        <option value="">Loading voices...</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Text to Speech Section -->
+        <div class="card">
+            <h2>💬 Text to Speech</h2>
+
+            <div class="form-group">
+                <label for="textInput">Enter text to speak:</label>
+                <textarea id="textInput" placeholder="Type something here..."></textarea>
+            </div>
+
+            <div class="form-group">
+                <label>Quick Phrases:</label>
+                <div class="quick-phrases">
+                    <div class="quick-phrase" onclick="setQuickPhrase('Hello, welcome to the Oracle ferrofluid speaker demonstration')">Demo</div>
+                    <div class="quick-phrase" onclick="setQuickPhrase('The ferrofluid dances to the rhythm of the sound')">Ferrofluid</div>
+                    <div class="quick-phrase" onclick="setQuickPhrase('Watch the magnetic field respond to my voice')">Magnetic</div>
+                    <div class="quick-phrase" onclick="setQuickPhrase('This is amazing!')">Amazing</div>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label for="voiceSelect">Voice:</label>
+                <select id="voiceSelect">
+                    <option value="">Loading voices...</option>
+                </select>
+            </div>
+
+            <button id="speakBtn" onclick="speak()">🎤 Speak</button>
+
+            <div id="status" class="status"></div>
+        </div>
+    </div>
+
+    <script>
+        let isPlaying = false;
+        let isRecording = false;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let conversationHistory = [];
+
+        async function loadVoices() {
+            try {
+                const response = await fetch('/api/voices');
+                const data = await response.json();
+
+                // Update both voice selects
+                const selects = [document.getElementById('voiceSelect'), document.getElementById('voiceSelectVoice')];
+
+                selects.forEach(select => {
+                    select.innerHTML = '';
+                    if (data.voices && data.voices.length > 0) {
+                        data.voices.forEach(voice => {
+                            const option = document.createElement('option');
+                            option.value = voice.voice_id;
+                            option.textContent = voice.name;
+                            select.appendChild(option);
+                        });
+                    } else {
+                        select.innerHTML = '<option value="">No voices available</option>';
+                    }
+                });
+            } catch (error) {
+                console.error('Error loading voices:', error);
+            }
+        }
+
+        // Load voices on page load
+        window.addEventListener('DOMContentLoaded', loadVoices);
+
+        async function saveApiKey() {
+            const apiKey = document.getElementById('apiKey').value;
+            if (!apiKey) {
+                alert('Please enter an API key');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({api_key: apiKey})
+                });
+
+                if (response.ok) {
+                    alert('API key saved! Reloading page...');
+                    location.reload();
+                } else {
+                    alert('Failed to save API key');
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+
+        function setQuickPhrase(text) {
+            document.getElementById('textInput').value = text;
+        }
+
+        async function toggleVoiceRecording() {
+            if (!isRecording) {
+                startRecording();
+            } else {
+                stopRecording();
+            }
+        }
+
+        async function startRecording() {
+            const statusEl = document.getElementById('voiceStatus');
+            const btnEl = document.getElementById('voiceBtn');
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.addEventListener('dataavailable', event => {
+                    audioChunks.push(event.data);
+                });
+
+                mediaRecorder.addEventListener('stop', async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    await sendAudioToMoneo(audioBlob);
+
+                    // Stop all tracks
+                    stream.getTracks().forEach(track => track.stop());
+                });
+
+                mediaRecorder.start();
+                isRecording = true;
+
+                btnEl.textContent = '🎤 Recording... (Click to stop)';
+                btnEl.classList.add('recording');
+                statusEl.className = 'status recording';
+                statusEl.textContent = '🎤 Listening...';
+
+            } catch (error) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ Microphone access denied: ' + error.message;
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+
+                const btnEl = document.getElementById('voiceBtn');
+                const statusEl = document.getElementById('voiceStatus');
+
+                btnEl.textContent = '🎤 Hold to Talk';
+                btnEl.classList.remove('recording');
+                statusEl.className = 'status playing';
+                statusEl.textContent = '⏳ Processing...';
+            }
+        }
+
+        async function sendAudioToMoneo(audioBlob) {
+            const statusEl = document.getElementById('voiceStatus');
+            const voiceId = document.getElementById('voiceSelectVoice').value;
+
+            try {
+                statusEl.textContent = '🧠 Transcribing...';
+
+                const formData = new FormData();
+                formData.append('audio', audioBlob, 'recording.webm');
+                formData.append('voice_id', voiceId);
+
+                const response = await fetch('/api/voice-chat', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    // Add messages to conversation display
+                    addMessage('user', result.transcript);
+                    addMessage('assistant', result.response);
+
+                    statusEl.textContent = '🎵 Playing response...';
+
+                    // Poll until playback complete
+                    pollPlaybackStatus();
+                } else {
+                    throw new Error(result.error || 'Failed to process voice');
+                }
+
+            } catch (error) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ Error: ' + error.message;
+            }
+        }
+
+        function addMessage(role, text) {
+            const conversation = document.getElementById('conversation');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            messageDiv.textContent = text;
+            conversation.appendChild(messageDiv);
+            conversation.scrollTop = conversation.scrollHeight;
+        }
+
+        async function speak() {
+            const text = document.getElementById('textInput').value.trim();
+            const voiceId = document.getElementById('voiceSelect').value;
+            const statusEl = document.getElementById('status');
+            const btnEl = document.getElementById('speakBtn');
+
+            if (!text) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '⚠️ Please enter some text';
+                return;
+            }
+
+            if (isPlaying) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '⚠️ Already playing';
+                return;
+            }
+
+            try {
+                btnEl.disabled = true;
+                isPlaying = true;
+
+                statusEl.className = 'status playing';
+                statusEl.textContent = '🎵 Generating speech...';
+
+                const response = await fetch('/api/speak', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text: text, voice_id: voiceId})
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    statusEl.textContent = '🎵 Playing with visualization...';
+                    pollPlaybackStatus();
+                } else {
+                    throw new Error(result.error || 'Failed to generate speech');
+                }
+
+            } catch (error) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ Error: ' + error.message;
+                btnEl.disabled = false;
+                isPlaying = false;
+            }
+        }
+
+        async function pollPlaybackStatus() {
+            const statusEl = document.getElementById('status');
+            const voiceStatusEl = document.getElementById('voiceStatus');
+            const btnEl = document.getElementById('speakBtn');
+
+            const interval = setInterval(async () => {
+                try {
+                    const response = await fetch('/api/status');
+                    const status = await response.json();
+
+                    if (!status.is_playing) {
+                        clearInterval(interval);
+                        statusEl.className = 'status success';
+                        statusEl.textContent = '✅ Playback complete!';
+                        voiceStatusEl.className = 'status success';
+                        voiceStatusEl.textContent = '✅ Complete!';
+                        btnEl.disabled = false;
+                        isPlaying = false;
+
+                        setTimeout(() => {
+                            statusEl.style.display = 'none';
+                            voiceStatusEl.style.display = 'none';
+                        }, 3000);
+                    }
+                } catch (error) {
+                    clearInterval(interval);
+                    btnEl.disabled = false;
+                    isPlaying = false;
+                }
+            }, 1000);
+        }
+    </script>
+</body>
+</html>

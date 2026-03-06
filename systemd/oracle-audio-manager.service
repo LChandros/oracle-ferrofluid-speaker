@@ -1,0 +1,23 @@
+[Unit]
+Description=Oracle Audio Manager - Unified audio routing service
+Documentation=https://github.com/tyahn/moneo
+After=sound.target alsa-restore.service
+Before=oracle-master.service raspotify.service
+
+[Service]
+Type=simple
+User=tyahn
+Group=tyahn
+WorkingDirectory=/home/tyahn
+ExecStart=/usr/bin/python3 /home/tyahn/oracle_audio_manager.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Prevent aggressive restart on persistent failures
+StartLimitInterval=60
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target

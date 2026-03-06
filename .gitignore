@@ -1,0 +1,35 @@
+# API Keys and Secrets
+oracle_api_key.txt
+*.key
+*.pem
+*.env
+
+# Logs
+*.log
+logs/
+*.txt.log
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Backups
+*.backup
+*.backup-*
+*.backup_*
+
+# Archives
+oracle-archive/
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
