@@ -1,0 +1,21 @@
+[Unit]
+Description=Oracle Audio Bridge (Loopback to Speakers)
+After=sound.target raspotify.service
+Wants=raspotify.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /home/tyahn/oracle_audio_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Priority settings - run with high priority for low-latency audio
+Nice=-10
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target

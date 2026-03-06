@@ -77,7 +77,6 @@ class OracleLEDController:
 
         # Audio capture for music reactivity
         self.audio_stream = None
-        self.speaker_stream = None  # Speaker passthrough
 
         # TTS audio level (for SPEAKING mode)
         self.tts_audio_level = 0.0
@@ -260,18 +259,7 @@ class OracleLEDController:
                 periodsize=CHUNK_SIZE
             )
             print("   ✓ Audio capture initialized")
-
-            # Open speaker output for passthrough
-            self.speaker_stream = alsaaudio.PCM(
-                alsaaudio.PCM_PLAYBACK,
-                alsaaudio.PCM_NORMAL,
-                device='hw:4,0',
-                channels=2,
-                rate=SAMPLE_RATE,
-                format=alsaaudio.PCM_FORMAT_S16_LE,
-                periodsize=CHUNK_SIZE
-            )
-            print("   ✓ Speaker passthrough initialized")
+            print("   ℹ Speaker passthrough handled by oracle-audio-bridge service")
         except Exception as e:
             print(f"   ✗ Failed to open audio: {e}")
             print("   Falling back to demo mode...")
@@ -287,10 +275,6 @@ class OracleLEDController:
                 length, data = self.audio_stream.read()
 
                 if length > 0:
-                    # Pass audio through to speakers
-                    if self.speaker_stream:
-                        self.speaker_stream.write(data)
-
                     # Convert stereo to mono
                     audio = struct.unpack(f'{length * 2}h', data)
                     mono = np.array([int((audio[i] + audio[i+1]) / 2) for i in range(0, len(audio), 2)])
