@@ -1,0 +1,14 @@
+[Unit]
+Description=Oracle Ferrofluid Speaker Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=tyahn
+WorkingDirectory=/home/tyahn/oracle/dashboard
+ExecStart=/usr/bin/python3 /home/tyahn/oracle/dashboard/app.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

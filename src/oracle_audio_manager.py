@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 class OracleAudioManager:
     def __init__(self):
-        self.loopback_capture = 'plughw:2,1'
+        self.loopback_capture = "plughw_2_1_shared"
         self.speaker_device = 'plughw:4,0'
         self.audio_bridge = None
         self.running = True

@@ -1,0 +1,13 @@
+[Unit]
+Description=Oracle Audio Volume Restore
+After=sound.target alsa-restore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/amixer -c 4 sset Headphone 127
+ExecStart=/usr/bin/amixer -c 4 sset Speaker 127
+ExecStart=/usr/bin/amixer -c 4 sset Playback 255
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

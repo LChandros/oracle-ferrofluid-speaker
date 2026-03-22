@@ -29,7 +29,7 @@ MAGNET_PIN = 23
 PWM_FREQUENCY = 1000  # 1kHz PWM
 
 # Audio config for music analysis
-AUDIO_DEVICE = "plughw:2,1"
+AUDIO_DEVICE = "/tmp/oracle_audio_fifo"  # dsnoop device for multiple capture
 SAMPLE_RATE = 44100  # Match Raspotify actual output
 CHUNK_SIZE = 1024
 
@@ -39,7 +39,7 @@ MAGNET_PARAMS = {
     'LISTENING': {'min_duty': 20, 'max_duty': 50},    # Gentle pulse
     'THINKING': {'min_duty': 15, 'max_duty': 70},     # Chaotic movement (increased range)
     'SPEAKING': {'min_duty': 30, 'max_duty': 85},     # Strong rhythmic (increased)
-    'MUSIC': {'min_duty': 0, 'max_duty': 100}         # Audio-reactive (full range)
+    'MUSIC': {'min_duty': 35, 'max_duty': 100}        # Audio-reactive (35% baseline hold)
 }
 
 # Audio analysis parameters (research-optimized)
@@ -52,7 +52,7 @@ FREQUENCY_RANGES = {
 # Beat detection parameters
 BEAT_HISTORY_SIZE = 20
 BEAT_THRESHOLD_MULTIPLIER = 1.4  # 40% above average = beat
-BEAT_BOOST_FACTOR = 1.8          # Boost PWM by 80% on beats
+BEAT_BOOST_FACTOR = 1.3          # Boost PWM by 30% on beats
 
 # Smoothing parameters
 SMOOTHING_NORMAL = 0.15    # Reduced from 0.3 for faster response
@@ -247,32 +247,48 @@ class OracleLEDController:
         print("   Mid-bass (80-250Hz): Accent")
         print("   Beat detection: ENABLED")
 
-        try:
-            # Open audio capture
-            self.audio_stream = alsaaudio.PCM(
-                alsaaudio.PCM_CAPTURE,
-                alsaaudio.PCM_NORMAL,
-                device=AUDIO_DEVICE,
-                channels=2,
-                rate=SAMPLE_RATE,
-                format=alsaaudio.PCM_FORMAT_S16_LE,
-                periodsize=CHUNK_SIZE
-            )
-            print("   ✓ Audio capture initialized")
-            print("   ℹ Speaker passthrough handled by oracle-audio-bridge service")
-        except Exception as e:
-            print(f"   ✗ Failed to open audio: {e}")
-            print("   Falling back to demo mode...")
-            self._animate_music_demo()
-            return
+        # Check if we have an external audio buffer (fed by master service bridge)
+        use_buffer = hasattr(self, 'audio_buffer') and self.audio_buffer is not None
+        
+        if use_buffer:
+            print("   ✓ Using shared audio buffer from master service")
+        else:
+            # Fallback: open direct ALSA capture from loopback
+            try:
+                self.audio_stream = alsaaudio.PCM(
+                    alsaaudio.PCM_CAPTURE,
+                    alsaaudio.PCM_NORMAL,
+                    device='plughw:2,1',
+                    channels=2,
+                    rate=SAMPLE_RATE,
+                    format=alsaaudio.PCM_FORMAT_S16_LE,
+                    periodsize=CHUNK_SIZE
+                )
+                print("   ✓ Direct ALSA capture from loopback (fallback)")
+            except Exception as e:
+                print(f"   ✗ Failed to open audio: {e}")
+                print("   Falling back to demo mode...")
+                self._animate_music_demo()
+                return
 
         hue_offset = 0
         magnet_smoothed = 0.0
         self.bass_history = []
+        frame_count = 0
 
         while self.running and self.current_state == 'MUSIC':
             try:
-                length, data = self.audio_stream.read()
+                # Read audio data
+                if use_buffer:
+                    if len(self.audio_buffer) > 0:
+                        length, data = self.audio_buffer.popleft()
+                    else:
+                        time.sleep(0.005)
+                        continue
+                else:
+                    length, data = self.audio_stream.read()
+
+                frame_count += 1
 
                 if length > 0:
                     # Convert stereo to mono
@@ -294,11 +310,17 @@ class OracleLEDController:
                     # Combine: Sub-bass is primary (70%), mid-bass is accent (30%)
                     combined_bass = (sub_bass * 0.7 + mid_bass * 0.3)
 
-                    # Normalize to 0-100
-                    if combined_bass > 100:
-                        bass_level = min(100, (combined_bass / 500) * 100)  # Adaptive scaling
-                    else:
-                        bass_level = 0
+                    # Adaptive normalization using running peak tracker
+                    if not hasattr(self, '_bass_peak'):
+                        self._bass_peak = combined_bass if combined_bass > 0 else 1.0
+                    if combined_bass > self._bass_peak:
+                        self._bass_peak = combined_bass
+                    # Slow decay so peak adapts to quieter passages
+                    self._bass_peak *= 0.999
+                    self._bass_peak = max(self._bass_peak, 1.0)
+                    
+                    # Normalize to 0-100 using adaptive peak
+                    bass_level = min(100, (combined_bass / self._bass_peak) * 100)
 
                     # Beat detection
                     self.bass_history.append(bass_level)
@@ -311,47 +333,58 @@ class OracleLEDController:
                         if bass_level > recent_avg * BEAT_THRESHOLD_MULTIPLIER and bass_level > 30:
                             is_beat = True
 
-                    # Calculate target PWM duty cycle
+                    # Apply noise floor - ignore very quiet audio
+                    if bass_level < 5:
+                        bass_level = 0
+
+                    # Map bass level onto baseline hold range
+                    # min_duty = baseline that keeps ferrofluid elevated
+                    # Dynamic range rides on top of baseline
+                    params = MAGNET_PARAMS['MUSIC']
+                    baseline = params['min_duty']
+                    ceiling = params['max_duty']
+                    
+                    # Calculate target: baseline + bass_level maps into remaining range
                     if is_beat:
-                        # BOOST on beats
-                        target_duty = min(100, bass_level * BEAT_BOOST_FACTOR)
-                        smoothing = SMOOTHING_BEAT  # Minimal smoothing for snap response
+                        dynamic = min(100, bass_level * BEAT_BOOST_FACTOR)
+                        smoothing = SMOOTHING_BEAT
                     else:
-                        target_duty = bass_level
+                        dynamic = bass_level
                         smoothing = SMOOTHING_NORMAL
+                    
+                    target_duty = baseline + (dynamic / 100.0) * (ceiling - baseline)
 
                     # Apply smoothing
                     magnet_smoothed = smoothing * magnet_smoothed + (1 - smoothing) * target_duty
                     self.magnet_pwm.ChangeDutyCycle(magnet_smoothed)
 
-                    # LED visualization (enhanced)
-                    # Get mid and high frequencies for color mixing
+                    # Debug logging every 200 frames
+                    if frame_count % 200 == 0:
+                        beat_mark = " BEAT!" if is_beat else ""
+                        print(f"   [AUDIO] Frame {frame_count}: sub={sub_bass:.1f} mid={mid_bass:.1f} bass={bass_level:.1f}% PWM={magnet_smoothed:.1f}%{beat_mark}")
+
+                    # LED visualization
                     mid_mask = (freqs >= 250) & (freqs < 2000)
                     high_mask = (freqs >= 2000) & (freqs < 8000)
                     mid_level = np.mean(magnitudes[mid_mask]) if np.any(mid_mask) else 0
                     high_level = np.mean(magnitudes[high_mask]) if np.any(high_mask) else 0
 
-                    # Normalize for LED display
                     max_mag = max(combined_bass, mid_level, high_level, 1)
                     bass_led = int((combined_bass / max_mag) * 255) if max_mag > 50 else 0
                     mid_led = int((mid_level / max_mag) * 255) if max_mag > 50 else 0
                     high_led = int((high_level / max_mag) * 255) if max_mag > 50 else 0
 
-                    # Beat flash
                     if is_beat:
                         bass_led = min(255, int(bass_led * 1.5))
                         mid_led = min(255, int(mid_led * 1.3))
 
                     for i in range(LED_COUNT):
-                        # Rotating base color
                         hue = (hue_offset + i * (360 / LED_COUNT)) % 360
 
-                        # Mix with frequency data (bass=red, mid=green, high=blue)
                         r = int(bass_led * 0.8 + high_led * 0.2)
                         g = int(mid_led * 0.9)
                         b = int(high_led * 0.8 + bass_led * 0.2)
 
-                        # Wave pattern
                         wave_pos = (hue_offset / 8 + i) % LED_COUNT
                         wave_brightness = abs(math.sin(wave_pos * math.pi / LED_COUNT))
 
@@ -371,11 +404,12 @@ class OracleLEDController:
                 time.sleep(0.01)
                 continue
             except Exception as e:
-                print(f"✗ Audio error: {e}")
+                print(f"   [ERROR] Music visualization: {type(e).__name__}: {e}")
                 time.sleep(0.1)
+                continue
 
         # Cleanup
-        if self.audio_stream:
+        if hasattr(self, 'audio_stream') and self.audio_stream:
             self.audio_stream.close()
             self.audio_stream = None
 
