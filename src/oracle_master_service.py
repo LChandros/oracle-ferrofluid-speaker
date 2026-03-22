@@ -150,6 +150,15 @@ REALTIME_TOOLS = [
     },
     {
         "type": "function",
+        "name": "morning_briefing",
+        "description": "Deliver Trevor's pre-generated morning briefing. Use when Trevor asks for his morning briefing, daily update, or says 'what's going on today'. This fetches a pre-compiled report with calendar, tasks, weather, news, and business status.",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "type": "function",
         "name": "moneo_query",
         "description": "Query Trevor's personal AI assistant Moneo for tasks, projects, or Clam business info. Do NOT use this for calendar or schedule questions - use get_calendar instead.",
         "parameters": {
@@ -973,6 +982,143 @@ class OracleMasterService:
 
     # ==================== AUDIO BRIDGE ====================
 
+    def _briefing_scheduler_loop(self):
+        """Check every minute if it's time for the morning briefing (10 AM ET)."""
+        from datetime import datetime as _dt
+        import pytz
+        delivered_today = False
+        et = pytz.timezone("America/New_York")
+
+        logger.info("[Briefing] Scheduler started - delivery at 10:00 AM ET")
+
+        while self.running:
+            try:
+                now = _dt.now(et)
+
+                # Reset flag at midnight
+                if now.hour == 0 and now.minute == 0:
+                    delivered_today = False
+
+                # Deliver at 10:00 AM ET (weekdays only)
+                if now.hour == 10 and now.minute == 0 and now.weekday() < 5 and not delivered_today:
+                    logger.info("[Briefing] 10:00 AM ET - delivering morning briefing")
+                    delivered_today = True
+                    self._deliver_morning_briefing()
+
+                time.sleep(30)  # Check every 30 seconds
+            except Exception as e:
+                logger.error(f"[Briefing] Scheduler error: {e}")
+                time.sleep(60)
+
+    def _deliver_morning_briefing(self):
+        """Auto-deliver morning briefing via Realtime API session."""
+        logger.info("[Briefing] Starting briefing delivery...")
+
+        try:
+            # Fetch briefing text
+            response = requests.get(
+                "http://100.71.119.36:3002/api/voice/briefing/today",
+                headers={"X-API-Key": MONEO_API_KEY},
+                timeout=10
+            )
+
+            if response.status_code == 404:
+                # Generate on the fly
+                logger.info("[Briefing] No pre-generated briefing, generating now...")
+                response = requests.post(
+                    "http://100.71.119.36:3002/api/voice/briefing/generate",
+                    headers={"X-API-Key": MONEO_API_KEY},
+                    timeout=60
+                )
+                if response.status_code != 200:
+                    logger.error("[Briefing] Generation failed")
+                    return
+                script = response.json().get("briefing", {}).get("script", "")
+            elif response.status_code == 200:
+                script = response.json().get("script", "")
+            else:
+                logger.error(f"[Briefing] API returned {response.status_code}")
+                return
+
+            if not script:
+                logger.error("[Briefing] Empty briefing script")
+                return
+
+            # Deliver via Realtime API session (same as wake word but auto-triggered)
+            self.realtime_session_active = True
+            self._spotify_was_playing = self.spotify_playing
+
+            if self._spotify_was_playing:
+                self.pause_spotify()
+
+            self.leds.set_state("SPEAKING")
+
+            # Play start chime
+            try:
+                subprocess.Popen(
+                    ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                ).communicate(input=self._generate_chime(), timeout=2)
+            except Exception:
+                pass
+
+            briefing_prompt = ORACLE_SYSTEM_PROMPT + f"""
+
+MORNING BRIEFING MODE:
+You have a pre-generated morning briefing to deliver. Read it to Trevor naturally, exactly as written.
+After reading the briefing, ask if he has any questions about anything mentioned.
+
+THE BRIEFING:
+{script}
+"""
+
+            session = OracleRealtimeSession(
+                api_key=OPENAI_API_KEY,
+                system_prompt=briefing_prompt,
+                tools=REALTIME_TOOLS,
+                tool_handler=self.handle_tool_call,
+                on_speech_started=lambda: self.leds.set_state("LISTENING"),
+                on_speech_ended=lambda: self.leds.set_state("THINKING"),
+                on_audio_started=lambda: self.leds.set_state("SPEAKING"),
+                on_response_done=lambda: None,
+                on_error=lambda msg: logger.error(f"[Briefing] Error: {msg}"),
+                on_mic_mute=self._mute_mic,
+                on_mic_unmute=self._unmute_mic,
+                session_timeout=4
+            )
+
+            self.current_session = session
+            session.start()
+
+            # Wait for session to end
+            while session.active and self.running:
+                time.sleep(0.1)
+
+            self.current_session = None
+            self.realtime_session_active = False
+
+            # End chime
+            time.sleep(2)
+            try:
+                subprocess.Popen(
+                    ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                ).communicate(input=self._generate_end_chime(), timeout=3)
+            except Exception:
+                pass
+
+            if self._spotify_was_playing:
+                self.resume_spotify()
+                self.leds.set_state("MUSIC")
+            else:
+                self.leds.set_state("IDLE")
+
+            logger.info("[Briefing] Delivery complete")
+
+        except Exception as e:
+            logger.error(f"[Briefing] Delivery error: {e}")
+            self.realtime_session_active = False
+
     def audio_bridge_loop(self):
         """Capture audio from loopback and feed visualization buffer.
 
@@ -1051,6 +1197,8 @@ class OracleMasterService:
                 args.get("date", "today"),
                 args.get("priority", "medium")
             )
+        elif name == "morning_briefing":
+            return self._tool_morning_briefing()
         elif name == "get_calendar":
             return self._tool_get_calendar(args.get("time_range", "today"))
         elif name == "create_calendar_event":
@@ -1118,6 +1266,35 @@ class OracleMasterService:
         except Exception as e:
             return {"error": str(e)}
 
+
+    def _tool_morning_briefing(self):
+        """Fetch and return the pre-generated morning briefing."""
+        try:
+            response = requests.get(
+                "http://100.71.119.36:3002/api/voice/briefing/today",
+                headers={"X-API-Key": MONEO_API_KEY},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                script = data.get("script", "No briefing available.")
+                return {"briefing": script, "instruction": "Read this briefing to Trevor exactly as written. After reading, ask if he has any questions."}
+            elif response.status_code == 404:
+                # No briefing generated yet, try generating one now
+                gen_response = requests.post(
+                    "http://100.71.119.36:3002/api/voice/briefing/generate",
+                    headers={"X-API-Key": MONEO_API_KEY},
+                    timeout=30
+                )
+                if gen_response.status_code == 200:
+                    data = gen_response.json()
+                    script = data.get("briefing", {}).get("script", "Briefing generation succeeded but no script found.")
+                    return {"briefing": script, "instruction": "Read this briefing to Trevor exactly as written. After reading, ask if he has any questions."}
+                return {"error": "Could not generate briefing"}
+            else:
+                return {"error": f"Briefing API returned {response.status_code}"}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _tool_get_calendar(self, time_range):
         """Get calendar events directly from REST API (no Claude, no hallucination)."""
@@ -1409,11 +1586,13 @@ class OracleMasterService:
         
         try:
             # Start background threads
+            briefing_thread = threading.Thread(target=self._briefing_scheduler_loop, daemon=True)
             bridge_thread = threading.Thread(target=self.audio_bridge_loop, daemon=True)
             spotify_thread = threading.Thread(target=self.monitor_spotify_loop, daemon=True)
             wake_thread = threading.Thread(target=self.wake_word_detection_loop, daemon=True)
             fifo_thread = threading.Thread(target=self.fifo_reader_loop, daemon=True)
 
+            briefing_thread.start()
             bridge_thread.start()
             spotify_thread.start()
             wake_thread.start()

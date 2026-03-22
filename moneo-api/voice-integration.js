@@ -24,6 +24,7 @@ class VoiceIntegration {
     this.projectManager = projectManager;
     this.notesManager = notesManager;
     this.emailManager = emailManager;
+    this.morningBriefing = null; // Set by moneo-core after initialization
 
     // API configuration
     this.port = config.voiceAssistant?.port || 3002;
@@ -327,6 +328,37 @@ class VoiceIntegration {
         res.json({ success: true, message: `Email sent to ${to}` });
       } catch (error) {
         logger.error('[Voice] Error sending email:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Morning briefing - generate now
+    this.app.post('/api/voice/briefing/generate', async (req, res) => {
+      try {
+        if (!this.morningBriefing) {
+          return res.status(503).json({ error: 'Morning briefing module not available' });
+        }
+        const result = await this.morningBriefing.generate();
+        res.json({ success: true, briefing: result });
+      } catch (error) {
+        logger.error('[Voice] Briefing generation error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Morning briefing - get today's briefing
+    this.app.get('/api/voice/briefing/today', async (req, res) => {
+      try {
+        if (!this.morningBriefing) {
+          return res.status(503).json({ error: 'Morning briefing module not available' });
+        }
+        const briefing = await this.morningBriefing.getTodaysBriefing();
+        if (!briefing) {
+          return res.status(404).json({ error: 'No briefing generated for today yet' });
+        }
+        res.json(briefing);
+      } catch (error) {
+        logger.error('[Voice] Briefing fetch error:', error);
         res.status(500).json({ error: error.message });
       }
     });
