@@ -134,8 +134,24 @@ REALTIME_TOOLS = [
     },
     {
         "type": "function",
+        "name": "get_calendar",
+        "description": "Get events from Trevor's Google Calendar. You MUST use this tool for ANY question about calendar, schedule, meetings, appointments, or what Trevor has planned. This returns real data from his actual calendar. Never guess calendar info.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "time_range": {
+                    "type": "string",
+                    "enum": ["today", "tomorrow", "week"],
+                    "description": "today, tomorrow, or week"
+                }
+            },
+            "required": ["time_range"]
+        }
+    },
+    {
+        "type": "function",
         "name": "moneo_query",
-        "description": "Query Trevor's personal AI assistant Moneo for tasks, calendar, emails, projects, or Clam business info. Use for anything about Trevor's schedule, work, or personal context.",
+        "description": "Query Trevor's personal AI assistant Moneo for tasks, projects, or Clam business info. Do NOT use this for calendar or schedule questions - use get_calendar instead.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -555,21 +571,43 @@ class OracleMasterService:
 
     @staticmethod
     def _generate_chime():
-        """Generate a short two-tone chime (ascending, ~200ms)."""
+        """Generate a short two-tone chime (ascending, ~200ms, stereo)."""
         import numpy as _np
         rate = 44100
         t1 = _np.linspace(0, 0.1, int(rate * 0.1), False)
         t2 = _np.linspace(0, 0.1, int(rate * 0.1), False)
-        # Two ascending tones: 800Hz -> 1200Hz
         tone1 = (_np.sin(2 * _np.pi * 800 * t1) * 16000).astype(_np.int16)
         tone2 = (_np.sin(2 * _np.pi * 1200 * t2) * 16000).astype(_np.int16)
-        # Apply fade in/out
         fade = _np.linspace(0, 1, len(tone1) // 4)
         tone1[:len(fade)] = (tone1[:len(fade)] * fade).astype(_np.int16)
         tone1[-len(fade):] = (tone1[-len(fade):] * fade[::-1]).astype(_np.int16)
         tone2[:len(fade)] = (tone2[:len(fade)] * fade).astype(_np.int16)
         tone2[-len(fade):] = (tone2[-len(fade):] * fade[::-1]).astype(_np.int16)
-        return _np.concatenate([tone1, tone2]).tobytes()
+        mono = _np.concatenate([tone1, tone2])
+        stereo = _np.empty(len(mono) * 2, dtype=_np.int16)
+        stereo[0::2] = mono
+        stereo[1::2] = mono
+        return stereo.tobytes()
+
+    @staticmethod
+    def _generate_end_chime():
+        """Generate a short two-tone chime (descending, ~200ms, stereo)."""
+        import numpy as _np
+        rate = 44100
+        t1 = _np.linspace(0, 0.1, int(rate * 0.1), False)
+        t2 = _np.linspace(0, 0.1, int(rate * 0.1), False)
+        tone1 = (_np.sin(2 * _np.pi * 1200 * t1) * 16000).astype(_np.int16)
+        tone2 = (_np.sin(2 * _np.pi * 800 * t2) * 16000).astype(_np.int16)
+        fade = _np.linspace(0, 1, len(tone1) // 4)
+        tone1[:len(fade)] = (tone1[:len(fade)] * fade).astype(_np.int16)
+        tone1[-len(fade):] = (tone1[-len(fade):] * fade[::-1]).astype(_np.int16)
+        tone2[:len(fade)] = (tone2[:len(fade)] * fade).astype(_np.int16)
+        tone2[-len(fade):] = (tone2[-len(fade):] * fade[::-1]).astype(_np.int16)
+        mono = _np.concatenate([tone1, tone2])
+        stereo = _np.empty(len(mono) * 2, dtype=_np.int16)
+        stereo[0::2] = mono
+        stereo[1::2] = mono
+        return stereo.tobytes()
 
     def _mute_mic(self):
         """Kill arecord to prevent echo during Oracle speech."""
@@ -611,7 +649,7 @@ class OracleMasterService:
         try:
             # Play a short confirmation tone so user knows Oracle heard them
             subprocess.Popen(
-                ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '1', '-r', '44100', '-t', 'raw'],
+                ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             ).communicate(input=self._generate_chime(), timeout=2)
         except Exception:
@@ -630,7 +668,7 @@ class OracleMasterService:
             on_error=lambda msg: logger.error(f"[Realtime] Error: {msg}"),
             on_mic_mute=self._mute_mic,
             on_mic_unmute=self._unmute_mic,
-            session_timeout=20
+            session_timeout=10
         )
 
         self.current_session = session
@@ -644,7 +682,16 @@ class OracleMasterService:
             # Cleanup
             self.current_session = None
             self.realtime_session_active = False
-            logger.info("[Realtime] Session ended, restoring state...")
+            logger.info("[Realtime] Session ended, playing end chime...")
+
+            # Play end chime (descending tone)
+            try:
+                subprocess.Popen(
+                    ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                ).communicate(input=self._generate_end_chime(), timeout=2)
+            except Exception:
+                pass
 
             if self._spotify_was_playing:
                 self.resume_spotify()
@@ -997,6 +1044,8 @@ class OracleMasterService:
                 args.get("date", "today"),
                 args.get("priority", "medium")
             )
+        elif name == "get_calendar":
+            return self._tool_get_calendar(args.get("time_range", "today"))
         elif name == "create_calendar_event":
             return self._tool_create_calendar_event(args)
         elif name == "send_email":
@@ -1062,6 +1111,44 @@ class OracleMasterService:
         except Exception as e:
             return {"error": str(e)}
 
+
+    def _tool_get_calendar(self, time_range):
+        """Get calendar events directly from REST API (no Claude, no hallucination)."""
+        try:
+            response = requests.get(
+                f"http://100.71.119.36:3002/api/voice/calendar/events?range={time_range}",
+                headers={"X-API-Key": MONEO_API_KEY},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                events = data.get("events", [])
+                if not events:
+                    return {"events": "none", "message": f"No events on calendar for {time_range}"}
+
+                event_list = []
+                for e in events:
+                    start = e.get("start", "")
+                    if "T" in start:
+                        from datetime import datetime as _dt
+                        t = _dt.fromisoformat(start.replace("Z", "+00:00"))
+                        time_str = t.strftime("%I:%M %p")
+                    else:
+                        time_str = start
+                    desc = e.get("description")
+                    entry = f"{time_str}: {e.get('summary', 'Untitled')}"
+                    if desc:
+                        entry += f" (Notes: {desc})"
+                    attendees = e.get("attendees")
+                    if attendees:
+                        entry += f" (Attendees: {attendees})"
+                    event_list.append(entry)
+
+                return {"events": event_list, "count": len(event_list)}
+            else:
+                return {"error": f"Calendar API returned {response.status_code}"}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _tool_create_calendar_event(self, args):
         """Create a Google Calendar event via Moneo API."""
