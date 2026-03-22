@@ -571,13 +571,13 @@ class OracleMasterService:
 
     @staticmethod
     def _generate_chime():
-        """Generate a short two-tone chime (ascending, ~200ms, stereo)."""
+        """Generate a two-tone chime (ascending, ~400ms, stereo)."""
         import numpy as _np
         rate = 44100
-        t1 = _np.linspace(0, 0.1, int(rate * 0.1), False)
-        t2 = _np.linspace(0, 0.1, int(rate * 0.1), False)
-        tone1 = (_np.sin(2 * _np.pi * 800 * t1) * 16000).astype(_np.int16)
-        tone2 = (_np.sin(2 * _np.pi * 1200 * t2) * 16000).astype(_np.int16)
+        t1 = _np.linspace(0, 0.2, int(rate * 0.2), False)
+        t2 = _np.linspace(0, 0.2, int(rate * 0.2), False)
+        tone1 = (_np.sin(2 * _np.pi * 800 * t1) * 30000).astype(_np.int16)
+        tone2 = (_np.sin(2 * _np.pi * 1200 * t2) * 30000).astype(_np.int16)
         fade = _np.linspace(0, 1, len(tone1) // 4)
         tone1[:len(fade)] = (tone1[:len(fade)] * fade).astype(_np.int16)
         tone1[-len(fade):] = (tone1[-len(fade):] * fade[::-1]).astype(_np.int16)
@@ -591,13 +591,13 @@ class OracleMasterService:
 
     @staticmethod
     def _generate_end_chime():
-        """Generate a short two-tone chime (descending, ~200ms, stereo)."""
+        """Generate a two-tone chime (descending, ~400ms, stereo, loud)."""
         import numpy as _np
         rate = 44100
-        t1 = _np.linspace(0, 0.1, int(rate * 0.1), False)
-        t2 = _np.linspace(0, 0.1, int(rate * 0.1), False)
-        tone1 = (_np.sin(2 * _np.pi * 1200 * t1) * 16000).astype(_np.int16)
-        tone2 = (_np.sin(2 * _np.pi * 800 * t2) * 16000).astype(_np.int16)
+        t1 = _np.linspace(0, 0.2, int(rate * 0.2), False)
+        t2 = _np.linspace(0, 0.2, int(rate * 0.2), False)
+        tone1 = (_np.sin(2 * _np.pi * 1200 * t1) * 30000).astype(_np.int16)
+        tone2 = (_np.sin(2 * _np.pi * 800 * t2) * 30000).astype(_np.int16)
         fade = _np.linspace(0, 1, len(tone1) // 4)
         tone1[:len(fade)] = (tone1[:len(fade)] * fade).astype(_np.int16)
         tone1[-len(fade):] = (tone1[-len(fade):] * fade[::-1]).astype(_np.int16)
@@ -668,7 +668,7 @@ class OracleMasterService:
             on_error=lambda msg: logger.error(f"[Realtime] Error: {msg}"),
             on_mic_mute=self._mute_mic,
             on_mic_unmute=self._unmute_mic,
-            session_timeout=10
+            session_timeout=4
         )
 
         self.current_session = session
@@ -682,16 +682,23 @@ class OracleMasterService:
             # Cleanup
             self.current_session = None
             self.realtime_session_active = False
-            logger.info("[Realtime] Session ended, playing end chime...")
+            logger.info("[Realtime] Session ended, waiting for speaker cleanup...")
+            time.sleep(2)  # Wait for Realtime session aplay to fully close
 
             # Play end chime (descending tone)
+            logger.info("[Realtime] Playing end chime")
             try:
-                subprocess.Popen(
+                p = subprocess.Popen(
                     ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
-                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                ).communicate(input=self._generate_end_chime(), timeout=2)
-            except Exception:
-                pass
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+                _, err = p.communicate(input=self._generate_end_chime(), timeout=3)
+                if p.returncode != 0:
+                    logger.error(f"[Realtime] End chime failed (exit {p.returncode}): {err.decode()[:100] if err else 'no error'}")
+                else:
+                    logger.info("[Realtime] End chime played OK")
+            except Exception as e:
+                logger.error(f"[Realtime] End chime exception: {e}")
 
             if self._spotify_was_playing:
                 self.resume_spotify()
