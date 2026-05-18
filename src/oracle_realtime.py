@@ -16,6 +16,7 @@ import time
 import logging
 from datetime import datetime
 import subprocess
+import requests
 
 logger = logging.getLogger('OracleRealtime')
 
@@ -71,7 +72,8 @@ class OracleRealtimeSession:
                  on_speech_started=None, on_speech_ended=None,
                  on_audio_started=None, on_response_done=None,
                  on_error=None, on_mic_mute=None, on_mic_unmute=None,
-                 session_timeout=20):
+                 on_user_transcript=None, auto_start=False, session_timeout=20,
+                 memory_url=None, memory_api_key=None, session_id=None):
         self.api_key = api_key
         self.system_prompt = system_prompt
         self.tools = tools
@@ -82,8 +84,15 @@ class OracleRealtimeSession:
         self.on_response_done = on_response_done
         self.on_error = on_error
         self.on_mic_mute = on_mic_mute      # Called to stop mic when Oracle speaks
-        self.on_mic_unmute = on_mic_unmute  # Called to restart mic after drain
+        self.on_mic_unmute = on_mic_unmute
+        self.on_user_transcript = on_user_transcript
+        self.auto_start = auto_start
+        self.transcript = []  # Collected conversation transcript  # Called to restart mic after drain
         self.session_timeout = session_timeout
+        # Phase 1: persistent cross-session memory
+        self.memory_url = memory_url            # e.g. http://droplet:3002
+        self.memory_api_key = memory_api_key
+        self.session_id = session_id or f"oracle-{int(time.time())}"
 
         self.active = False
         self.audio_queue = queue.Queue()
@@ -92,6 +101,8 @@ class OracleRealtimeSession:
         self._last_activity = 0
         self._first_audio_in_response = True
         self._is_responding = False  # True while Oracle is speaking (mute mic to prevent echo)
+        self._loop = None
+        self._ws_ref = None
 
     def start(self):
         """Start the session in a background thread."""
@@ -106,10 +117,58 @@ class OracleRealtimeSession:
         if self._thread:
             self._thread.join(timeout=5)
 
+
+    def interrupt(self):
+        """Interrupt Oracle while speaking - cancel response and resume listening."""
+        if not self.active or not self._is_responding:
+            return False
+        logger.info("[Realtime] INTERRUPT - cancelling response")
+        self._is_responding = False
+        self._first_audio_in_response = True
+        # Kill speaker immediately to stop audio
+        self._cleanup_speaker()
+        self._open_speaker()
+        # Flush queued audio
+        while not self.audio_queue.empty():
+            try: self.audio_queue.get_nowait()
+            except: break
+        # Send cancel to API via async
+        if hasattr(self, "_ws_ref") and self._ws_ref and self._loop:
+            try:
+                import json as _json
+                asyncio.run_coroutine_threadsafe(
+                    self._ws_ref.send(_json.dumps({"type": "response.cancel"})),
+                    self._loop
+                )
+                asyncio.run_coroutine_threadsafe(
+                    self._ws_ref.send(_json.dumps({"type": "input_audio_buffer.clear"})),
+                    self._loop
+                )
+            except Exception as e:
+                logger.error(f"[Realtime] Interrupt send error: {e}")
+        return True
+
     def feed_audio(self, length, data):
         """Feed mic audio into the session (called from wake word thread)."""
         if self.active and length > 0:
             self.audio_queue.put(data)
+
+    def _log_turn_async(self, role, content):
+        """Fire-and-forget POST to droplet's /api/oracle/log.
+        Run in a daemon thread so a slow/down droplet never blocks audio."""
+        if not self.memory_url or not content:
+            return
+        def _post():
+            try:
+                requests.post(
+                    f"{self.memory_url.rstrip('/')}/api/oracle/log",
+                    headers={'X-API-Key': self.memory_api_key or '', 'Content-Type': 'application/json'},
+                    json={'session_id': self.session_id, 'role': role, 'content': content},
+                    timeout=3,
+                )
+            except Exception as e:
+                logger.warning(f"[Memory] log failed ({role}): {e}")
+        threading.Thread(target=_post, daemon=True).start()
 
     def _run(self):
         """Run the async session in a new event loop."""
@@ -130,6 +189,7 @@ class OracleRealtimeSession:
             "OpenAI-Beta": "realtime=v1"
         }
 
+        self._loop = asyncio.get_event_loop()
         logger.info(f"[Realtime] Connecting to {REALTIME_MODEL}...")
 
         try:
@@ -137,7 +197,8 @@ class OracleRealtimeSession:
                 REALTIME_URL,
                 additional_headers=headers,
                 max_size=None,
-                ping_interval=20
+                ping_interval=10,
+                ping_timeout=None
             ) as ws:
                 # Wait for session.created
                 msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
@@ -145,6 +206,7 @@ class OracleRealtimeSession:
                     logger.error(f"[Realtime] Unexpected: {msg['type']}")
                     return
 
+                self._ws_ref = ws
                 logger.info("[Realtime] Connected, configuring session...")
 
                 # Configure session with current time injected
@@ -178,6 +240,11 @@ class OracleRealtimeSession:
 
                 # Open speaker output to loopback
                 self._open_speaker()
+
+                # If auto_start, immediately trigger the model to speak
+                if self.auto_start:
+                    logger.info("[Realtime] Auto-start: sending response.create")
+                    await ws.send(json.dumps({"type": "response.create"}))
 
                 # Run concurrently
                 sender = asyncio.create_task(self._send_audio_loop(ws))
@@ -255,9 +322,7 @@ class OracleRealtimeSession:
                     if self._first_audio_in_response:
                         self._first_audio_in_response = False
                         self._is_responding = True
-                        # IMMEDIATELY mute mic to prevent any echo
-                        if self.on_mic_mute:
-                            self.on_mic_mute()
+                        # Mic stays alive for voice interrupt
                         # Flush any audio already queued
                         while not self.audio_queue.empty():
                             try: self.audio_queue.get_nowait()
@@ -292,11 +357,18 @@ class OracleRealtimeSession:
                     transcript = event.get("transcript", "")
                     if transcript:
                         logger.info(f"[Realtime] Oracle: {transcript[:150]}")
+                        self.transcript.append({"role": "oracle", "text": transcript})
+                        self._log_turn_async("assistant", transcript)
 
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     transcript = event.get("transcript", "")
                     if transcript:
                         logger.info(f"[Realtime] Trevor: {transcript[:150]}")
+                        self.transcript.append({"role": "trevor", "text": transcript})
+                        self._log_turn_async("user", transcript)
+                        # Check for briefing request - signal to master service
+                        if self.on_user_transcript:
+                            self.on_user_transcript(transcript)
 
                 elif etype == "response.function_call_arguments.done":
                     call_id = event.get("call_id", "")
@@ -326,9 +398,10 @@ class OracleRealtimeSession:
                 elif etype == "response.done":
                     self._first_audio_in_response = True
                     if self._is_responding:
-                        # Audio was played - drain speaker and restart mic
+                        # Audio response complete - drain speaker before accepting mic input
                         logger.info("[Realtime] Audio response complete, draining speaker...")
-                        self._ws_ref = ws
+                        # Keep _is_responding True so send loop keeps dropping mic audio
+                        # Schedule drain in background - will clear buffer and reset flag after delay
                         asyncio.create_task(self._drain_flush_unmute())
                     else:
                         # No audio (tool-call-only response) - no drain needed
@@ -352,10 +425,10 @@ class OracleRealtimeSession:
                 logger.error(f"[Realtime] Event error: {e}")
 
     async def _drain_flush_unmute(self):
-        """Wait for speaker to drain, then restart mic."""
-        await asyncio.sleep(2.0)  # Let speaker buffer drain
+        """Wait for speaker to drain, then allow mic input again."""
+        await asyncio.sleep(1.5)  # Let speaker buffer drain and room echo die
 
-        # Flush any leftover audio in queue
+        # Flush any leftover audio in queue (picked up during drain)
         flushed = 0
         while not self.audio_queue.empty():
             try:
@@ -364,24 +437,22 @@ class OracleRealtimeSession:
             except queue.Empty:
                 break
 
-        # Clear API input buffer
+        # Clear API input buffer so stale audio doesn't trigger VAD
         if hasattr(self, '_ws_ref') and self._ws_ref:
             try:
                 await self._ws_ref.send(json.dumps({"type": "input_audio_buffer.clear"}))
             except Exception:
                 pass
 
-        # Restart mic (was killed when Oracle started speaking)
-        if self.on_mic_unmute:
-            self.on_mic_unmute()
-
+        # Now safe to accept mic input again
         self._is_responding = False
-        logger.info(f"[Realtime] Mic restarted (flushed {flushed} chunks)")
+        self._last_activity = time.time()  # Reset timeout since we just finished speaking
+        logger.info(f"[Realtime] Echo suppression lifted (flushed {flushed} chunks, 1.5s drain)")
 
     async def _check_timeout(self):
         """Close session after inactivity."""
         while self.active:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             if time.time() - self._last_activity > self.session_timeout:
                 logger.info(f"[Realtime] Timeout ({self.session_timeout}s)")
                 self.active = False

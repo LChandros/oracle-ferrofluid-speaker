@@ -15,6 +15,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const Anthropic = require('@anthropic-ai/sdk');
 const logger = require('../utils/logger');
+const OracleConversationStore = require('./oracle-conversation-store');
 
 class VoiceIntegration {
   constructor(config, tasksManager, calendarManager, projectManager, notesManager, emailManager) {
@@ -25,6 +26,7 @@ class VoiceIntegration {
     this.notesManager = notesManager;
     this.emailManager = emailManager;
     this.morningBriefing = null; // Set by moneo-core after initialization
+    this.meetingScheduler = null; // Set by moneo-core after initialization
 
     // API configuration
     this.port = config.voiceAssistant?.port || 3002;
@@ -41,6 +43,9 @@ class VoiceIntegration {
     // Key: sessionId, Value: array of messages
     this.conversationHistory = new Map();
     this.maxHistoryLength = 20;
+
+    // Phase 1: persistent cross-session conversation log for Oracle
+    this.oracleStore = new OracleConversationStore();
 
     // Tools for Claude
     this.tools = [
@@ -89,6 +94,20 @@ class VoiceIntegration {
             }
           }
         }
+      },
+      {
+        name: 'schedule_meeting',
+        description: 'Schedule a meeting between Trevor and Moneo. Use this when Trevor wants to schedule a meeting, review, check-in, or discussion. Examples: "schedule a meeting for friday at 2 to discuss YFP financials", "set up a weekly GPJ review on Mondays at 10".',
+        input_schema: {
+          type: 'object',
+          properties: {
+            request: {
+              type: 'string',
+              description: 'The natural language meeting request exactly as Trevor stated it'
+            }
+          },
+          required: ['request']
+        }
       }
     ];
 
@@ -134,6 +153,19 @@ class VoiceIntegration {
       this.server = this.app.listen(this.port, () => {
         logger.info(`Voice Integration API listening on port ${this.port}`);
       });
+      this.server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+          logger.warn(`Voice Integration: Port ${this.port} in use, retrying in 5s...`);
+          setTimeout(() => {
+            this.server.close();
+            this.server = this.app.listen(this.port, () => {
+              logger.info(`Voice Integration API listening on port ${this.port} (retry)`);
+            });
+          }, 5000);
+        } else {
+          logger.error('Voice Integration server error:', err);
+        }
+      });
 
       logger.info('Voice Integration initialized successfully');
     } catch (error) {
@@ -151,6 +183,178 @@ class VoiceIntegration {
         maxTokens: this.maxTokens,
         uptime: process.uptime()
       });
+    });
+
+    // Voice capture — real-time task/commitment/note tracking from Oracle
+    this.app.post('/api/voice/capture', async (req, res) => {
+      try {
+        const { type, text, project } = req.body;
+        if (!type || !text) {
+          return res.status(400).json({ error: 'type and text required' });
+        }
+
+        const fs = require('fs').promises;
+        const path = require('path');
+        const results = { type, text, actions: [] };
+
+        // 1. Add tasks and commitments to the punch list
+        if ((type === 'task' || type === 'commitment') && this.punchListManager) {
+          const context = project || 'Personal';
+          await this.punchListManager.addItem(text, context);
+          results.actions.push(`Added to punch list (${context})`);
+          logger.info(`[Voice Capture] Added ${type} to punch list: "${text}" [${context}]`);
+        }
+
+        // 2. Handle completions — search punch list and constraint dashboard
+        if (type === 'complete' || (type === 'note' && /taken care of|done|finished|completed|remove|resolved/i.test(text))) {
+          let matched = false;
+
+          // Try to match and complete a punch list item
+          if (this.punchListManager) {
+            const pending = this.punchListManager.getPendingItems();
+            const Anthropic = require('@anthropic-ai/sdk');
+            const anthropic = new Anthropic({ apiKey: this.config.anthropicApiKey || process.env.ANTHROPIC_API_KEY });
+
+            if (pending.length > 0) {
+              const matchResp = await anthropic.messages.create({
+                model: 'claude-haiku-4-5-20251001',
+                max_tokens: 100,
+                messages: [{
+                  role: 'user',
+                  content: `Trevor said this is done: "${text}"\n\nWhich of these items (if any) is he referring to? Return ONLY the index number (0-based), or "none" if no match.\n\n${pending.map((p, i) => `${i}: ${p.description}`).join('\n')}`
+                }]
+              });
+              const matchText = (matchResp.content[0]?.text || '').trim();
+              const matchIdx = parseInt(matchText);
+              if (!isNaN(matchIdx) && matchIdx >= 0 && matchIdx < pending.length) {
+                const item = pending[matchIdx];
+                await this.punchListManager.completeItem(item.id);
+                results.actions.push(`Completed punch list item: ${item.description}`);
+                logger.info(`[Voice Capture] Completed punch list item: ${item.description}`);
+                matched = true;
+              }
+            }
+          }
+
+          // Try to match constraint dashboard items via Claude
+          const dashPath = path.join(__dirname, '../../data/context/constraint-dashboard.json');
+          try {
+            const dashRaw = await fs.readFile(dashPath, 'utf8');
+            const dash = JSON.parse(dashRaw);
+            let dashChanged = false;
+
+            // Build list of all matchable items
+            const matchableItems = [];
+            for (const w of (dash.waitingOn || [])) {
+              matchableItems.push({ source: 'waitingOn', id: w.id, desc: w.description });
+            }
+            for (const goal of (dash.activeGoals || [])) {
+              matchableItems.push({ source: 'goal', id: goal.id, desc: goal.name });
+              for (const b of (goal.blockers || [])) {
+                matchableItems.push({ source: 'blocker', goalId: goal.id, desc: b });
+              }
+            }
+
+            if (matchableItems.length > 0) {
+              const Anthropic = require('@anthropic-ai/sdk');
+              const anthropic = new Anthropic({ apiKey: this.config.anthropicApiKey || process.env.ANTHROPIC_API_KEY });
+              const dashMatchResp = await anthropic.messages.create({
+                model: 'claude-haiku-4-5-20251001',
+                max_tokens: 200,
+                messages: [{
+                  role: 'user',
+                  content: `Trevor said this is done/resolved: "${text}"\n\nWhich of these items (if any) match what he's referring to? Return ONLY a JSON array of matching indices (0-based), or [] if none match.\n\n${matchableItems.map((m, i) => `${i}: [${m.source}] ${m.desc}`).join('\n')}`
+                }]
+              });
+              const dashMatchText = (dashMatchResp.content[0]?.text || '[]').trim();
+              let matchIndices = [];
+              try {
+                const jsonMatch = dashMatchText.match(/\[[\d,\s]*\]/);
+                if (jsonMatch) matchIndices = JSON.parse(jsonMatch[0]);
+              } catch {}
+
+              for (const idx of matchIndices) {
+                const item = matchableItems[idx];
+                if (!item) continue;
+
+                if (item.source === 'waitingOn') {
+                  dash.waitingOn = dash.waitingOn.filter(w => w.id !== item.id);
+                  results.actions.push(`Removed waiting-on: ${item.desc}`);
+                  logger.info(`[Voice Capture] Removed waiting-on: ${item.desc}`);
+                  dashChanged = true;
+                } else if (item.source === 'blocker') {
+                  const goal = dash.activeGoals.find(g => g.id === item.goalId);
+                  if (goal) {
+                    goal.blockers = goal.blockers.filter(b => b !== item.desc);
+                    results.actions.push(`Removed blocker from ${goal.name}: ${item.desc}`);
+                    logger.info(`[Voice Capture] Removed blocker from ${goal.name}: ${item.desc}`);
+                    dashChanged = true;
+                  }
+                } else if (item.source === 'goal') {
+                  // Archive the goal
+                  dash.activeGoals = dash.activeGoals.filter(g => g.id !== item.id);
+                  if (!dash.archivedGoals) dash.archivedGoals = [];
+                  dash.archivedGoals.push({ id: item.id, name: item.desc, reason: 'Completed (voice)', archivedDate: new Date().toISOString().split('T')[0] });
+                  results.actions.push(`Archived goal: ${item.desc}`);
+                  logger.info(`[Voice Capture] Archived goal: ${item.desc}`);
+                  dashChanged = true;
+                }
+              }
+            }
+
+            if (dashChanged) {
+              dash.lastUpdated = new Date().toISOString();
+              await fs.writeFile(dashPath, JSON.stringify(dash, null, 2));
+              results.actions.push('Constraint dashboard updated');
+            }
+          } catch (e) {
+            logger.warn(`[Voice Capture] Dashboard update failed: ${e.message}`);
+          }
+        }
+
+        // 3. Always log to today's vault transcript
+        const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+        const vaultPath = `/home/moneo/vault/moneo/briefings/${dateStr}.md`;
+        try {
+          let existing = '';
+          try { existing = await fs.readFile(vaultPath, 'utf8'); } catch {}
+
+          const timestamp = new Date().toLocaleTimeString('en-US', {
+            hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'America/New_York'
+          });
+          const entry = `- **${type}** (${timestamp}): ${text}\n`;
+
+          if (existing.includes('## Voice Captures')) {
+            existing = existing.replace('## Voice Captures\n', `## Voice Captures\n${entry}`);
+          } else {
+            existing += `\n## Voice Captures\n${entry}`;
+          }
+          await fs.writeFile(vaultPath, existing);
+        } catch (e) {
+          logger.warn(`[Voice Capture] Vault write failed: ${e.message}`);
+        }
+
+        logger.info(`[Voice Capture] Processed: type=${type}, actions=${results.actions.length}`);
+        res.json({ success: true, ...results });
+      } catch (error) {
+        logger.error('[Voice Capture] Error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Get punch list tasks
+    this.app.get('/api/voice/tasks', async (req, res) => {
+      try {
+        if (!this.punchListManager) {
+          return res.status(503).json({ error: 'Punch list not available' });
+        }
+        const items = this.punchListManager.getPendingItems();
+        const grouped = this.punchListManager.getPendingByContext();
+        res.json({ success: true, count: items.length, items, grouped });
+      } catch (error) {
+        logger.error('[Voice] Tasks fetch error:', error);
+        res.status(500).json({ error: error.message });
+      }
     });
 
     // Chat endpoint
@@ -347,6 +551,92 @@ class VoiceIntegration {
     });
 
     // Morning briefing - get today's briefing
+    // Check-in transcript extraction — extracts commitments, tasks, and notes from Q&A
+    this.app.post('/api/voice/checkin/extract', async (req, res) => {
+      try {
+        const { transcript } = req.body;
+        if (!transcript || !Array.isArray(transcript) || transcript.length === 0) {
+          return res.status(400).json({ error: 'No transcript provided' });
+        }
+
+        const Anthropic = require('@anthropic-ai/sdk');
+        const anthropic = new Anthropic({ apiKey: this.config.anthropicApiKey || process.env.ANTHROPIC_API_KEY });
+        const fs = require('fs').promises;
+        const path = require('path');
+
+        // Format transcript for Claude
+        const formatted = transcript.map(entry => {
+          const role = entry.role === 'assistant' ? 'Oracle' : 'Trevor';
+          return `${role}: ${entry.text}`;
+        }).join('\n');
+
+        const response = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 500,
+          system: `Extract actionable items from this morning check-in conversation between Trevor and Oracle. Return ONLY valid JSON with this structure:
+{
+  "commitments": ["things Trevor said he would do today"],
+  "tasks": ["specific tasks mentioned that need tracking"],
+  "decisions": ["decisions Trevor made during the check-in"],
+  "notes": ["other important context or updates"]
+}
+Only include items that were explicitly stated. Do not infer or add items that weren't discussed. If a category has no items, use an empty array.`,
+          messages: [{ role: 'user', content: formatted }]
+        });
+
+        let extracted = { commitments: [], tasks: [], decisions: [], notes: [] };
+        try {
+          const text = response.content[0]?.text || '{}';
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) extracted = JSON.parse(jsonMatch[0]);
+        } catch (e) {
+          logger.warn('[Voice] Failed to parse extraction response');
+        }
+
+        const totalCaptured = extracted.commitments.length + extracted.tasks.length +
+          extracted.decisions.length + extracted.notes.length;
+
+        // Append to today's briefing transcript in vault
+        if (totalCaptured > 0) {
+          const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+          const vaultPath = `/home/moneo/vault/moneo/briefings/${dateStr}.md`;
+          try {
+            let existing = '';
+            try { existing = await fs.readFile(vaultPath, 'utf8'); } catch {}
+
+            let appendText = '\n## Check-in Captures\n\n';
+            if (extracted.commitments.length > 0) {
+              appendText += '**Commitments:**\n' + extracted.commitments.map(c => `- ${c}`).join('\n') + '\n\n';
+            }
+            if (extracted.tasks.length > 0) {
+              appendText += '**Tasks:**\n' + extracted.tasks.map(t => `- [ ] ${t}`).join('\n') + '\n\n';
+            }
+            if (extracted.decisions.length > 0) {
+              appendText += '**Decisions:**\n' + extracted.decisions.map(d => `- ${d}`).join('\n') + '\n\n';
+            }
+            if (extracted.notes.length > 0) {
+              appendText += '**Notes:**\n' + extracted.notes.map(n => `- ${n}`).join('\n') + '\n\n';
+            }
+
+            if (existing) {
+              await fs.writeFile(vaultPath, existing + appendText);
+            } else {
+              await fs.writeFile(vaultPath, `# Check-in — ${dateStr}\n\n` + appendText);
+            }
+            logger.info(`[Voice] Saved ${totalCaptured} captures to vault: ${vaultPath}`);
+          } catch (e) {
+            logger.warn(`[Voice] Failed to write captures to vault: ${e.message}`);
+          }
+        }
+
+        logger.info(`[Voice] Extracted from check-in: ${extracted.commitments.length} commitments, ${extracted.tasks.length} tasks, ${extracted.decisions.length} decisions, ${extracted.notes.length} notes`);
+        res.json({ success: true, captured: totalCaptured, extracted });
+      } catch (error) {
+        logger.error('[Voice] Check-in extraction error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
     this.app.get('/api/voice/briefing/today', async (req, res) => {
       try {
         if (!this.morningBriefing) {
@@ -359,6 +649,38 @@ class VoiceIntegration {
         res.json(briefing);
       } catch (error) {
         logger.error('[Voice] Briefing fetch error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ===== Phase 1: Oracle cross-session conversation log =====
+
+    this.app.post('/api/oracle/log', (req, res) => {
+      try {
+        const { session_id, role, content } = req.body;
+        if (!session_id || !role || !content) {
+          return res.status(400).json({ error: 'session_id, role, content all required' });
+        }
+        if (role !== 'user' && role !== 'assistant') {
+          return res.status(400).json({ error: 'role must be "user" or "assistant"' });
+        }
+        const id = this.oracleStore.log(session_id, role, content);
+        res.json({ status: 'ok', id });
+      } catch (error) {
+        logger.error('[Oracle] log error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    this.app.get('/api/oracle/context', (req, res) => {
+      try {
+        const hours = parseInt(req.query.hours || '24', 10);
+        const limit = parseInt(req.query.limit || '20', 10);
+        const turns = this.oracleStore.getRecent(hours, limit);
+        const formatted = this.oracleStore.formatForPrompt(hours, limit);
+        res.json({ turns, formatted, count: turns.length });
+      } catch (error) {
+        logger.error('[Oracle] context error:', error);
         res.status(500).json({ error: error.message });
       }
     });
@@ -604,6 +926,23 @@ class VoiceIntegration {
           }
         }
 
+        case 'schedule_meeting': {
+          if (!this.meetingScheduler) {
+            return { error: 'Meeting scheduler not available' };
+          }
+          const result = await this.meetingScheduler.scheduleMeeting(input.request, 'voice');
+          if (result.success) {
+            return {
+              success: true,
+              confirmation: result.confirmation,
+              meetingId: result.meeting.id,
+              scheduledTime: result.meeting.scheduledTime,
+              topic: result.meeting.topic
+            };
+          }
+          return { error: result.error };
+        }
+
         default:
           throw new Error(`Unknown tool: ${toolName}`);
       }
@@ -630,7 +969,7 @@ You are being accessed through Oracle, Trevor's voice-controlled ferrofluid disp
 - Electromagnet: Currently pulsing in sync with visual states to create ferrofluid animations
 - Wake word: "JARVIS"
 - Voice: Using Piper TTS (en_US-lessac-medium)
-- Location: Development hub (Raspberry Pi at 100.82.131.122)
+- Location: Development hub (Raspberry Pi on Tailscale)
 
 This is Trevor's Oracle project - a voice interface to Moneo with visual ferrofluid feedback.
 

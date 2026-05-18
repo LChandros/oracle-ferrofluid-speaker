@@ -626,9 +626,14 @@ class OracleMasterService:
                 if self.current_session:
                     self.current_session.active = False  # Kill current session
 
+        # Phase 1: pull recent conversation context + mint fresh session id
+        sid = self._new_session_id()
+        ctx_prefix = self._fetch_recent_context(hours=24, limit=20)
+        prompt = ORACLE_SYSTEM_PROMPT + ("\n\n" + ctx_prefix if ctx_prefix else "")
+
         session = OracleRealtimeSession(
             api_key=OPENAI_API_KEY,
-            system_prompt=ORACLE_SYSTEM_PROMPT,
+            system_prompt=prompt,
             tools=REALTIME_TOOLS,
             tool_handler=self.tools.handle,
             on_speech_started=lambda: self.leds.set_state("LISTENING"),
@@ -639,7 +644,10 @@ class OracleMasterService:
             on_mic_mute=self._mute_mic,
             on_mic_unmute=self._unmute_mic,
             on_user_transcript=_check_briefing_request,
-            session_timeout=20
+            session_timeout=20,
+            memory_url=self._memory_base_url(),
+            memory_api_key=MONEO_API_KEY,
+            session_id=sid,
         )
         self.current_session = session
         session.start()
@@ -765,7 +773,10 @@ If he doesn't say anything, the session will time out and that's fine.
             on_error=lambda msg: logger.error(f"[Reminder Listen] Error: {msg}"),
             on_mic_mute=self._mute_mic,
             on_mic_unmute=self._unmute_mic,
-            session_timeout=8  # Slightly longer timeout for acknowledgment
+            session_timeout=8,  # Slightly longer timeout for acknowledgment
+            memory_url=self._memory_base_url(),
+            memory_api_key=MONEO_API_KEY,
+            session_id=self.session_id,
         )
         self.current_session = session
         session.start()
@@ -908,7 +919,10 @@ CONVERSATION RULES:
                     on_response_done=lambda: None,
                     on_error=lambda msg: logger.error(f"[Briefing Q&A] Error: {msg}"),
                     on_mic_mute=self._mute_mic, on_mic_unmute=self._unmute_mic,
-                    auto_start=True, session_timeout=30
+                    auto_start=True, session_timeout=30,
+                    memory_url=self._memory_base_url(),
+                    memory_api_key=MONEO_API_KEY,
+                    session_id=self.session_id,
                 )
                 self.current_session = session
                 session.start()
@@ -949,6 +963,39 @@ CONVERSATION RULES:
             import traceback
             logger.error(traceback.format_exc())
             self.realtime_session_active = False
+
+    # ==================== MEMORY ====================
+
+    def _memory_base_url(self):
+        """Derive memory endpoint base from MONEO_API_URL."""
+        return MONEO_API_URL.rsplit('/api/', 1)[0]
+
+    def _fetch_recent_context(self, hours=24, limit=20):
+        """Pull last N hours of conversation as a system-prompt prefix.
+        Bounded by 3s timeout; returns '' on any failure so a slow droplet never blocks a session start."""
+        try:
+            r = requests.get(
+                f"{self._memory_base_url()}/api/oracle/context",
+                params={'hours': hours, 'limit': limit},
+                headers={'X-API-Key': MONEO_API_KEY},
+                timeout=3,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                count = data.get('count', 0)
+                formatted = data.get('formatted', '')
+                if count > 0:
+                    logger.info(f"[Memory] Injected {count} prior turns into session prompt")
+                return formatted
+            logger.warning(f"[Memory] context fetch HTTP {r.status_code}")
+        except Exception as e:
+            logger.warning(f"[Memory] context fetch failed: {e}")
+        return ''
+
+    def _new_session_id(self):
+        """Mint a fresh session id and update self.session_id."""
+        self.session_id = f"oracle-{int(time.time())}"
+        return self.session_id
 
     # ==================== HEARTBEAT ====================
 
