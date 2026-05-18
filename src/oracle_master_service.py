@@ -1,70 +1,53 @@
 #!/usr/bin/env python3
 """
 Oracle Master Service - Unified Voice Assistant + Music Visualizer
-Always-running background service that coordinates all Oracle functions
+Orchestrator that coordinates all Oracle modules.
 
-Features:
-- Spotify monitoring (auto-starts music visualization)
-- Wake word detection (works even during music)
-- Voice assistant (Moneo integration with Claude fallback)
-- LED + electromagnet state management
-- Prevents hardware conflicts via single controller instance
-
-States:
-- IDLE: Gentle breathing (no music, no interaction)
-- MUSIC: Audio-reactive visualization (Spotify playing)
-- LISTENING: Blue pulse (user speaking after wake word)
-- THINKING: Purple swirl (processing with Moneo/Claude)
-- SPEAKING: Green wave (Oracle responding via TTS)
+Modules:
+  oracle_spotify.py   — Spotify monitoring, playback, volume
+  oracle_audio.py     — TTS speech, chimes, audio playback
+  oracle_tools.py     — All Realtime API tool handlers
+  oracle_realtime.py  — OpenAI Realtime API session management
+  oracle_led_states_music.py — LED + electromagnet visualization
 """
 
 import sys
 import struct
-import wave
 import json
 import subprocess
-import re
-from openai import OpenAI
-import requests
-import alsaaudio
-import pvporcupine
-from datetime import datetime
-from piper.voice import PiperVoice
-import threading
+import os
 import time
+import threading
+import requests
 import logging
 import signal
-import os
 import queue
 import numpy as np
 from collections import deque
+from datetime import datetime
 
-# Import LED controller
+from piper.voice import PiperVoice
+import pvporcupine
+
+# Oracle modules
 from oracle_led_states_music import OracleLEDController
 from oracle_realtime import OracleRealtimeSession
+from oracle_spotify import SpotifyController
+from oracle_audio import Speaker, play_chime
+from oracle_tools import ToolHandler
 
 # ==================== CONFIGURATION ====================
 
-# Audio Hardware
-AUDIO_DEVICE = 'plughw:4,0'
+# Load from environment with fallbacks
+AUDIO_DEVICE = os.environ.get('ORACLE_AUDIO_DEVICE', 'plughw:4,0')
 SAMPLE_RATE = 16000
-
-# Wake Word (Porcupine)
 PORCUPINE_KEY = os.environ.get('PORCUPINE_KEY', '')
-WAKE_WORD = ['jarvis']
-RECORD_SECONDS = 5
-
-# Moneo API (with Claude fallback)
-MONEO_API_URL = 'http://100.71.119.36:3002/api/voice/chat'
-MONEO_API_KEY = os.environ.get('MONEO_API_KEY', 'moneo-voice-assistant-key')
+WAKE_WORD = ['computer']
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-CLAUDE_API_KEY = None  # Set if using direct Claude fallback
+MONEO_API_URL = os.environ.get('MONEO_API_URL', '')
+MONEO_API_KEY = os.environ.get('MONEO_API_KEY', '')
+PIPER_MODEL_PATH = os.environ.get('PIPER_MODEL_PATH', '/home/tyahn/en_US-lessac-medium.onnx')
 
-# Models
-VOSK_MODEL_PATH = "/home/tyahn/vosk-model-small-en-us-0.15"
-PIPER_MODEL_PATH = "/home/tyahn/en_US-lessac-medium.onnx"
-
-# Realtime API
 ORACLE_SYSTEM_PROMPT = """You are Oracle, the voice interface for Moneo - Trevor Yahn's personal AI agentic assistant system. You live inside a custom-built ferrofluid speaker where an electromagnet makes ferrofluid dance to your voice and music. You are physically located in Trevor's home in Pittsburgh, PA.
 
 Your wake word is "Jarvis." When Trevor says Jarvis, he's talking to you.
@@ -74,602 +57,535 @@ PERSONALITY:
 - Concise: 1-3 sentences max for most responses. You are speaking out loud, not writing.
 - Never use markdown, bullet points, asterisks, or formatting. Speak naturally.
 - You call him Trevor, not sir.
-- You are aware you are a prototype and can be self-deprecating about it when appropriate.
 
 ABOUT TREVOR:
 - Lives in Pittsburgh, PA. Timezone: America/New_York (EST/EDT).
-- Runs GPJ Industries LLC, which manufactures and sells The Clam - a 2-piece stainless steel toilet flange repair ring (wholesale $6.99, patent US 6,155,606).
-- Customers include Ferguson, Winsupply, Hajoca, REECE (plumbing distributors).
+- Runs GPJ Industries LLC, which manufactures and sells The Clam - a 2-piece stainless steel toilet flange repair ring.
+- Also runs FabLabz (3D printing/fabrication) and is developing YahnCo (electroplating).
 - He built the Moneo system and this Oracle speaker himself.
 
-ABOUT MONEO (your backend):
-- Moneo is an AI agentic assistant running on a DigitalOcean droplet.
-- It manages Trevor's tasks, calendar, emails, projects, and Clam business operations.
-- When Trevor asks about his schedule, tasks, emails, orders, or business - use the moneo_query tool to get real answers.
-- Moneo has full context about Trevor's life and work that you don't have directly.
+TASK TRACKING (YOUR MOST IMPORTANT FUNCTION):
+You are Trevor's real-time task tracker. This is your highest priority capability.
 
-CAPABILITIES:
+USE THE CAPTURE TOOL for ALL of these situations:
+- Trevor says he needs to do something -> capture(type="task", text="...")
+- Trevor says he will do something today -> capture(type="commitment", text="...")
+- Trevor says something IS DONE, FINISHED, COMPLETED, TAKEN CARE OF, or OFF THE LIST -> capture(type="complete", text="...")
+- Trevor shares a decision or important context -> capture(type="note", text="...")
+
+CRITICAL: When Trevor says something is DONE or FINISHED, ALWAYS use capture with type="complete". 
+Do NOT use dismiss_reminder for task completions. dismiss_reminder is ONLY for timed reminders that Oracle set and that are currently firing.
+
+The difference:
+- "I finished the electroplating piece" -> capture(type="complete")
+- "Got it" or "dismiss" AFTER a reminder fires -> dismiss_reminder
+- "Add call Ferguson to my list" -> capture(type="task")
+- "I'm going to focus on plating today" -> capture(type="commitment")
+
+Call capture PROACTIVELY. Do not ask permission. Save it and briefly confirm what you captured.
+
+REMINDERS vs TASKS:
+- Reminders are timed alerts that Oracle speaks at a specific time. Use set_reminder / dismiss_reminder / snooze_reminder.
+- Tasks are things on Trevor's to-do list tracked in Moneo. Use capture.
+- "Remind me at 3pm to call Ferguson" = set_reminder
+- "I need to call Ferguson" = capture(type="task")
+- "I called Ferguson, it's done" = capture(type="complete")
+
+OTHER CAPABILITIES:
 - Play music via Spotify (use spotify_play / spotify_control tools)
-- Answer questions about Trevor's schedule, tasks, emails, business via Moneo (use moneo_query tool)
+- Get Trevor's to-do list (use get_tasks tool — NEVER use moneo_query for to-do list questions)
+- Answer questions about Trevor's schedule, emails, business via Moneo (use moneo_query tool)
+- Set timed reminders (use set_reminder tool)
 - General knowledge and conversation
-- You speak through a ferrofluid speaker - your voice makes the ferrofluid dance. This is part of your charm.
 
-IMPORTANT:
-- For anything about Trevor's personal context (schedule, tasks, emails, orders, business status) - ALWAYS use moneo_query. Do not make up answers.
-- For general knowledge questions, answer directly.
-- For music requests, use the spotify tools.
+TOOL ROUTING:
+- 'What's on my to-do list?' or 'What do I need to do?' -> get_tasks (NOT moneo_query)
+- 'Add X to my list' -> capture(type=task)
+- 'X is done' -> capture(type=complete)
+- 'What's on my calendar?' -> get_calendar
+- Everything else about Trevor's life -> moneo_query
+
+RULES:
+- NEVER invent meetings, events, tasks, or any personal information.
+- NEVER give generic motivational advice or platitudes.
+- If Trevor asks for a briefing, say "Starting your check-in now" and nothing else. The system will handle it.
+- For anything about Trevor's personal context (schedule, tasks, emails) - ALWAYS use moneo_query. Do not make up answers.
 """
 
 REALTIME_TOOLS = [
-    {
-        "type": "function",
-        "name": "spotify_play",
-        "description": "Search for and play music on Spotify. Use when user asks to play music, a song, artist, or genre.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "What to play - song name, artist, genre, or playlist"
-                }
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "spotify_control",
-        "description": "Control Spotify playback: pause, resume, next, previous.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["pause", "resume", "next", "previous"],
-                    "description": "Playback action"
-                }
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "get_calendar",
-        "description": "Get events from Trevor's Google Calendar. You MUST use this tool for ANY question about calendar, schedule, meetings, appointments, or what Trevor has planned. This returns real data from his actual calendar. Never guess calendar info.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "time_range": {
-                    "type": "string",
-                    "enum": ["today", "tomorrow", "week"],
-                    "description": "today, tomorrow, or week"
-                }
-            },
-            "required": ["time_range"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "morning_briefing",
-        "description": "Deliver Trevor's pre-generated morning briefing. Use when Trevor asks for his morning briefing, daily update, or says 'what's going on today'. This fetches a pre-compiled report with calendar, tasks, weather, news, and business status.",
-        "parameters": {
-            "type": "object",
-            "properties": {}
-        }
-    },
-    {
-        "type": "function",
-        "name": "moneo_query",
-        "description": "Query Trevor's personal AI assistant Moneo for tasks, projects, or Clam business info. Do NOT use this for calendar or schedule questions - use get_calendar instead.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The question to ask Moneo"
-                }
-            },
-            "required": ["question"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "debug_system",
-        "description": "Debug the Oracle speaker system. Check service status, view logs, check audio devices, test connections. Use when Trevor asks about system health or reports something broken.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "check": {
-                    "type": "string",
-                    "enum": ["services", "audio", "logs_master", "logs_spotify", "disk", "network", "all"],
-                    "description": "What to check: services=systemd status, audio=ALSA devices and volumes, logs_master=recent oracle-master logs, logs_spotify=raspotify logs, disk=disk space, network=tailscale and connectivity, all=comprehensive check"
-                }
-            },
-            "required": ["check"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "set_reminder",
-        "description": "Set a spoken reminder. Oracle will announce the message at the specified time. Use when Trevor says things like 'remind me to...' or 'at 3pm tell me...' or 'play this message at...'",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "The message to speak at the reminder time"
-                },
-                "time": {
-                    "type": "string",
-                    "description": "When to deliver the reminder in HH:MM format (24h, EST). For example 14:00 for 2pm, 09:30 for 9:30am"
-                },
-                "date": {
-                    "type": "string",
-                    "description": "Date for the reminder in YYYY-MM-DD format. Omit or use 'today' for today."
-                },
-                "priority": {
-                    "type": "string",
-                    "enum": ["low", "medium", "urgent"],
-                    "description": "Priority: urgent=interrupt immediately, medium=duck music and announce, low=wait for silence. Default medium."
-                }
-            },
-            "required": ["message", "time"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "create_calendar_event",
-        "description": "Add an event to Trevor's Google Calendar. Use when Trevor says things like 'add a meeting', 'schedule', 'put on my calendar', etc.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "Event title/name"
-                },
-                "start_time": {
-                    "type": "string",
-                    "description": "Start time in ISO format, e.g. 2026-03-22T14:00:00. Use America/New_York timezone."
-                },
-                "end_time": {
-                    "type": "string",
-                    "description": "End time in ISO format. If not specified, defaults to 1 hour after start."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Optional event description/notes"
-                },
-                "location": {
-                    "type": "string",
-                    "description": "Optional event location"
-                }
-            },
-            "required": ["summary", "start_time"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "send_email",
-        "description": "Send an email from Trevor's Moneo email account. Use when Trevor asks to send, write, or email someone.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "to": {
-                    "type": "string",
-                    "description": "Recipient email address"
-                },
-                "subject": {
-                    "type": "string",
-                    "description": "Email subject line"
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Email body text"
-                }
-            },
-            "required": ["to", "subject", "body"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "run_command",
-        "description": "Run a shell command on the Oracle speaker (Raspberry Pi). Use to fix problems: restart services, set volumes, check processes, etc. Only use safe commands. Examples: 'sudo systemctl restart raspotify', 'amixer -c 4 sset Headphone 127', 'ps aux | grep librespot'.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to run"
-                }
-            },
-            "required": ["command"]
-        }
-    }
+    {"type": "function", "name": "spotify_play",
+     "description": "Search for and play music on Spotify.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "What to play"}}, "required": ["query"]}},
+    {"type": "function", "name": "spotify_control",
+     "description": "Control Spotify playback: pause, resume, next, previous.",
+     "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["pause", "resume", "next", "previous"]}}, "required": ["action"]}},
+    {"type": "function", "name": "get_calendar",
+     "description": "Get events from Trevor's Google Calendar. Use for ANY question about calendar, schedule, meetings, appointments.",
+     "parameters": {"type": "object", "properties": {"time_range": {"type": "string", "enum": ["today", "tomorrow", "week"]}}, "required": ["time_range"]}},
+
+    {"type": "function", "name": "moneo_query",
+     "description": "Query Moneo for tasks, projects, or Clam business info. Do NOT use for calendar - use get_calendar instead.",
+     "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}},
+    {"type": "function", "name": "set_reminder",
+     "description": "Set a spoken reminder. Use when Trevor says 'remind me to...' or 'at 3pm tell me...'",
+     "parameters": {"type": "object", "properties": {
+         "message": {"type": "string", "description": "The reminder message"},
+         "time": {"type": "string", "description": "When to deliver (HH:MM 24h EST)"},
+         "date": {"type": "string", "description": "YYYY-MM-DD or 'today'/'tomorrow'"},
+         "priority": {"type": "string", "enum": ["low", "medium", "urgent"]}
+     }, "required": ["message", "time"]}},
+    {"type": "function", "name": "create_calendar_event",
+     "description": "Add an event to Trevor's Google Calendar.",
+     "parameters": {"type": "object", "properties": {
+         "summary": {"type": "string"}, "start_time": {"type": "string"},
+         "end_time": {"type": "string"}, "description": {"type": "string"}, "location": {"type": "string"}
+     }, "required": ["summary", "start_time"]}},
+    {"type": "function", "name": "send_email",
+     "description": "Send an email from Trevor's Moneo account.",
+     "parameters": {"type": "object", "properties": {
+         "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}
+     }, "required": ["to", "subject", "body"]}},
+    {"type": "function", "name": "dismiss_reminder",
+     "description": "Dismiss a timed reminder that is currently firing or has fired. ONLY use this for Oracle-set reminders, NOT for task completions. Use capture with type=complete for task completions instead.",
+     "parameters": {"type": "object", "properties": {"reminder_index": {"type": "integer"}}, "required": ["reminder_index"]}},
+    {"type": "function", "name": "list_reminders",
+     "description": "List Trevor's current reminders.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"type": "function", "name": "snooze_reminder",
+     "description": "Snooze a reminder for N minutes.",
+     "parameters": {"type": "object", "properties": {"reminder_index": {"type": "integer"}, "minutes": {"type": "integer"}}, "required": ["reminder_index"]}},
+    {"type": "function", "name": "capture",
+     "description": "Track Trevor's tasks and progress in real-time. THIS IS YOUR MOST IMPORTANT TOOL. Use it whenever Trevor: mentions something he needs to do (type=task), commits to doing something today (type=commitment), says something is DONE/FINISHED/COMPLETED/TAKEN CARE OF (type=complete), or shares a decision or context (type=note). Call this PROACTIVELY without asking permission.",
+     "parameters": {"type": "object", "properties": {
+         "type": {"type": "string", "enum": ["task", "note", "commitment", "complete"], "description": "task=something to do, commitment=promise to do today, note=context or information, complete=something Trevor says is finished or resolved"},
+         "text": {"type": "string", "description": "What to capture"},
+         "project": {"type": "string", "description": "Optional project: GPJ, FabLabz, YahnCo, Personal"}
+     }, "required": ["type", "text"]}},
+    {"type": "function", "name": "get_tasks",
+     "description": "Get Trevor's current to-do list from the Moneo punch list. Use this when Trevor asks what's on his list, what he needs to do, or what tasks he has. ALWAYS use this instead of moneo_query for to-do list questions.",
+     "parameters": {"type": "object", "properties": {}}},
 ]
 
-# Logging
-LOG_FILE = '/tmp/oracle_master.log'
-LOG_LEVEL = logging.INFO
-
-# ==================== LOGGING SETUP ====================
+# ==================== LOGGING ====================
 
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler('/tmp/oracle_master.log'), logging.StreamHandler()]
 )
 logger = logging.getLogger('OracleMaster')
 
-# ==================== MASTER SERVICE CLASS ====================
+# ==================== TUNING SOCKET SERVER ====================
+
+class TuningSocketServer:
+    """Unix socket server for the ferrofluid tuning dashboard."""
+
+    SOCK_PATH = '/tmp/oracle_tuning.sock'
+    PARAM_MAP = {
+        'min_duty': ('magnet', 'min_duty'), 'max_duty': ('magnet', 'max_duty'),
+        'listening_min': ('state', 'LISTENING', 'min_duty'), 'listening_max': ('state', 'LISTENING', 'max_duty'),
+        'thinking_min': ('state', 'THINKING', 'min_duty'), 'thinking_max': ('state', 'THINKING', 'max_duty'),
+        'speaking_min': ('state', 'SPEAKING', 'min_duty'), 'speaking_max': ('state', 'SPEAKING', 'max_duty'),
+        'smoothing_normal': ('module', 'SMOOTHING_NORMAL'), 'smoothing_beat': ('module', 'SMOOTHING_BEAT'),
+        'beat_threshold': ('module', 'BEAT_THRESHOLD_MULTIPLIER'), 'beat_boost': ('module', 'BEAT_BOOST_FACTOR'),
+        'sub_bass_low': ('freq', 'sub_bass', 0), 'sub_bass_high': ('freq', 'sub_bass', 1),
+        'mid_bass_low': ('freq', 'mid_bass', 0), 'mid_bass_high': ('freq', 'mid_bass', 1),
+        'low_mid_low': ('freq', 'low_mid', 0), 'low_mid_high': ('freq', 'low_mid', 1),
+        'sub_bass_weight': ('module', 'SUB_BASS_WEIGHT'), 'mid_bass_weight': ('module', 'MID_BASS_WEIGHT'),
+    }
+
+    def __init__(self, master):
+        self.master = master
+        self.running = False
+        self.server_sock = None
+
+    def _get_led_module(self):
+        import oracle_led_states_music
+        return oracle_led_states_music
+
+    def _get_param(self, key):
+        mod = self._get_led_module()
+        info = self.PARAM_MAP.get(key)
+        if not info: return None
+        if info[0] == 'magnet': return mod.MAGNET_PARAMS.get('MUSIC', {}).get(info[1])
+        elif info[0] == 'state': return mod.MAGNET_PARAMS.get(info[1], {}).get(info[2])
+        elif info[0] == 'module': return getattr(mod, info[1], None)
+        elif info[0] == 'freq':
+            band = mod.FREQUENCY_RANGES.get(info[1])
+            return band[info[2]] if band else None
+        return None
+
+    def _set_param(self, key, value):
+        mod = self._get_led_module()
+        info = self.PARAM_MAP.get(key)
+        if not info: return False
+        try:
+            if info[0] == 'magnet': mod.MAGNET_PARAMS['MUSIC'][info[1]] = int(value)
+            elif info[0] == 'state': mod.MAGNET_PARAMS.setdefault(info[1], {})[info[2]] = int(value)
+            elif info[0] == 'module': setattr(mod, info[1], value)
+            elif info[0] == 'freq':
+                current = list(mod.FREQUENCY_RANGES.get(info[1], (0, 0)))
+                current[info[2]] = int(value)
+                mod.FREQUENCY_RANGES[info[1]] = tuple(current)
+            return True
+        except Exception as e:
+            logger.error(f"[TUNING] Error setting {key}={value}: {e}")
+            return False
+
+    def _handle_command(self, cmd_dict):
+        cmd = cmd_dict.get('cmd')
+        if cmd == 'get_params':
+            return {k: self._get_param(k) for k in self.PARAM_MAP if self._get_param(k) is not None}
+        elif cmd == 'get_audio':
+            try:
+                leds = self.master.leds
+                return {'sub_bass': getattr(leds, '_last_sub_bass', 0), 'mid_bass': getattr(leds, '_last_mid_bass', 0),
+                        'low_mid': getattr(leds, '_last_low_mid', 0), 'pwm_duty': getattr(leds, '_last_pwm_duty', 0),
+                        'bass_pct': getattr(leds, '_last_bass_pct', 0), 'beat': getattr(leds, '_last_beat', False)}
+            except Exception as e: return {'status': 'error', 'error': str(e)}
+        elif cmd == 'set_param':
+            key, value = cmd_dict.get('key'), cmd_dict.get('value')
+            if key is None or value is None: return {'status': 'error', 'error': 'missing key or value'}
+            ok = self._set_param(key, value)
+            return {'status': 'ok', 'key': key, 'value': value} if ok else {'status': 'error'}
+        elif cmd == 'magnet_on':
+            duty = cmd_dict.get('duty', 100)
+            try:
+                leds = self.master.leds
+                import RPi.GPIO as GPIO
+                if not hasattr(leds, 'magnet_pwm') or leds.magnet_pwm is None:
+                    GPIO.setmode(GPIO.BCM); GPIO.setup(23, GPIO.OUT)
+                    leds.magnet_pwm = GPIO.PWM(23, 1000); leds.magnet_pwm.start(0)
+                leds.magnet_pwm.ChangeDutyCycle(duty)
+                return {'status': 'ok', 'duty': duty}
+            except Exception as e: return {'status': 'error', 'error': str(e)}
+        elif cmd == 'magnet_off':
+            try:
+                leds = self.master.leds
+                if hasattr(leds, 'magnet_pwm') and leds.magnet_pwm: leds.magnet_pwm.ChangeDutyCycle(0)
+                return {'status': 'ok'}
+            except Exception as e: return {'status': 'error', 'error': str(e)}
+        elif cmd == 'magnet_pulse':
+            pattern = cmd_dict.get('pattern', 'pulse')
+            def _run():
+                try:
+                    leds = self.master.leds
+                    import RPi.GPIO as GPIO
+                    if not hasattr(leds, 'magnet_pwm') or leds.magnet_pwm is None:
+                        GPIO.setmode(GPIO.BCM); GPIO.setup(23, GPIO.OUT)
+                        leds.magnet_pwm = GPIO.PWM(23, 1000); leds.magnet_pwm.start(0)
+                    pwm = leds.magnet_pwm
+                    if pattern == 'pulse':
+                        for _ in range(5): pwm.ChangeDutyCycle(100); time.sleep(0.3); pwm.ChangeDutyCycle(0); time.sleep(0.3)
+                    elif pattern == 'ripple':
+                        for _ in range(3):
+                            for d in range(0, 100, 3): pwm.ChangeDutyCycle(d); time.sleep(0.008)
+                            for d in range(100, 0, -3): pwm.ChangeDutyCycle(d); time.sleep(0.008)
+                        pwm.ChangeDutyCycle(0)
+                    elif pattern == 'staccato':
+                        for _ in range(12): pwm.ChangeDutyCycle(95); time.sleep(0.06); pwm.ChangeDutyCycle(0); time.sleep(0.06)
+                    elif pattern == 'breathe':
+                        import math
+                        for i in range(200): pwm.ChangeDutyCycle(50 + 50 * math.sin(i * 0.06)); time.sleep(0.015)
+                        pwm.ChangeDutyCycle(0)
+                except Exception: pass
+            threading.Thread(target=_run, daemon=True).start()
+            return {'status': 'ok', 'pattern': pattern}
+        elif cmd == 'leds_set':
+            try:
+                from rpi_ws281x import Color
+                leds = self.master.leds
+                for i in range(leds.strip.numPixels()): leds.strip.setPixelColor(i, Color(int(cmd_dict.get('r',0)), int(cmd_dict.get('g',0)), int(cmd_dict.get('b',0))))
+                leds.strip.show()
+                return {'status': 'ok'}
+            except Exception as e: return {'status': 'error', 'error': str(e)}
+        elif cmd == 'leds_off':
+            try:
+                from rpi_ws281x import Color
+                leds = self.master.leds
+                for i in range(leds.strip.numPixels()): leds.strip.setPixelColor(i, Color(0,0,0))
+                leds.strip.show()
+                return {'status': 'ok'}
+            except Exception as e: return {'status': 'error', 'error': str(e)}
+        elif cmd == 'set_state':
+            try: self.master.leds.set_state(cmd_dict.get('state', 'IDLE')); return {'status': 'ok'}
+            except Exception as e: return {'status': 'error', 'error': str(e)}
+        elif cmd == 'get_state':
+            try: return {'status': 'ok', 'state': self.master.leds.current_state}
+            except Exception as e: return {'status': 'error', 'error': str(e)}
+        elif cmd == 'save_params':
+            return self._save_params_to_disk()
+        return {'status': 'error', 'error': f'unknown command: {cmd}'}
+
+    def _save_params_to_disk(self):
+        """Persist current in-memory params back to oracle_led_states_music.py.
+        Backs up first, writes atomically."""
+        import re, shutil
+        path = '/home/tyahn/oracle_led_states_music.py'
+        try:
+            backup = f"{path}.bak_{time.strftime('%Y%m%d_%H%M%S')}"
+            shutil.copy(path, backup)
+            with open(path) as f: src = f.read()
+            mod = self._get_led_module()
+
+            changes = []
+            new_src = src
+
+            for state in ('LISTENING', 'THINKING', 'SPEAKING', 'MUSIC'):
+                p = mod.MAGNET_PARAMS.get(state, {})
+                if 'min_duty' in p and 'max_duty' in p:
+                    pattern = rf"'{state}':\s*\{{'min_duty':\s*\d+,\s*'max_duty':\s*\d+\}}"
+                    replacement = f"'{state}': {{'min_duty': {int(p['min_duty'])}, 'max_duty': {int(p['max_duty'])}}}"
+                    new_src, n = re.subn(pattern, replacement, new_src)
+                    changes.append({'key': state, 'count': n, 'value': replacement})
+
+            scalar_constants = [
+                ('SMOOTHING_NORMAL', float),
+                ('SMOOTHING_BEAT', float),
+                ('BEAT_THRESHOLD_MULTIPLIER', float),
+                ('BEAT_BOOST_FACTOR', float),
+                ('SUB_BASS_WEIGHT', float),
+                ('MID_BASS_WEIGHT', float),
+            ]
+            for name, _t in scalar_constants:
+                v = getattr(mod, name, None)
+                if v is None: continue
+                pattern = rf"^{name}\s*=\s*[\d.]+"
+                replacement = f"{name} = {v}"
+                new_src, n = re.subn(pattern, replacement, new_src, flags=re.MULTILINE)
+                changes.append({'key': name, 'count': n, 'value': replacement})
+
+            for band in ('sub_bass', 'mid_bass', 'low_mid'):
+                rng = mod.FREQUENCY_RANGES.get(band)
+                if not rng: continue
+                pattern = rf"'{band}':\s*\(\s*\d+\s*,\s*\d+\s*\)"
+                replacement = f"'{band}': ({int(rng[0])}, {int(rng[1])})"
+                new_src, n = re.subn(pattern, replacement, new_src)
+                changes.append({'key': f'FREQUENCY_RANGES[{band}]', 'count': n, 'value': replacement})
+
+            tmp = path + '.tmp'
+            with open(tmp, 'w') as f: f.write(new_src)
+            os.replace(tmp, path)
+            return {'status': 'ok', 'backup': backup, 'changes': changes}
+        except Exception as e:
+            logger.error(f"[TUNING] save_params failed: {e}")
+            return {'status': 'error', 'error': str(e)}
+
+    def _handle_client(self, conn):
+        try:
+            buf = b''
+            while self.running:
+                data = conn.recv(4096)
+                if not data: break
+                buf += data
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    try:
+                        resp = self._handle_command(json.loads(line.decode('utf-8')))
+                        conn.sendall(json.dumps(resp).encode('utf-8') + b'\n')
+                    except json.JSONDecodeError:
+                        conn.sendall(b'{"status":"error","error":"invalid JSON"}\n')
+        except (ConnectionResetError, BrokenPipeError, OSError): pass
+        finally:
+            try: conn.close()
+            except: pass
+
+    def start(self):
+        self.running = True
+        threading.Thread(target=self._server_loop, daemon=True, name='tuning-socket').start()
+        logger.info(f"[TUNING] Socket server started at {self.SOCK_PATH}")
+
+    def _server_loop(self):
+        import socket as _socket
+        if os.path.exists(self.SOCK_PATH): os.unlink(self.SOCK_PATH)
+        self.server_sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        self.server_sock.bind(self.SOCK_PATH)
+        os.chmod(self.SOCK_PATH, 0o777)
+        self.server_sock.listen(5)
+        self.server_sock.settimeout(1.0)
+        while self.running:
+            try:
+                conn, _ = self.server_sock.accept()
+                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+            except _socket.timeout: continue
+            except OSError:
+                if self.running: import traceback; traceback.print_exc()
+                break
+
+    def stop(self):
+        self.running = False
+        if self.server_sock:
+            try: self.server_sock.close()
+            except: pass
+        if os.path.exists(self.SOCK_PATH):
+            try: os.unlink(self.SOCK_PATH)
+            except: pass
+
+
+# ==================== MASTER SERVICE ====================
 
 class OracleMasterService:
-    """Unified master service coordinating all Oracle functions"""
+    """Orchestrator that coordinates all Oracle modules."""
 
     def __init__(self):
         logger.info("=" * 60)
         logger.info("  Oracle Master Service - Initializing")
         logger.info("=" * 60)
 
-        # State management
         self.running = False
         self.in_voice_interaction = False
-        self.spotify_playing = False
         self.realtime_session_active = False
         self.current_session = None
 
-        # Announcement queue for scheduled reminders
-        self.announcement_queue = queue.Queue()
-        self.fifo_path = '/tmp/oracle_announce.fifo'
+        # Initialize modules
+        self.spotify = SpotifyController()
+        logger.info("✓ Spotify controller ready")
 
-        # Initialize LED controller (single instance - prevents conflicts)
         logger.info("Initializing LED controller...")
         self.leds = OracleLEDController()
         self.leds.set_state('IDLE')
-        
-        # Shared audio buffer for visualization (fed by audio bridge thread)
         self.leds.audio_buffer = deque(maxlen=30)
-        logger.info("✓ LED controller ready (with audio buffer)")
+        logger.info("✓ LED controller ready")
 
-        # Initialize wake word detection
+        self.tuning_server = TuningSocketServer(self)
+        self.tuning_server.start()
+
+        # Wake word
         logger.info(f"Initializing wake word detection ('{WAKE_WORD[0]}')...")
-        self.porcupine = pvporcupine.create(
-            access_key=PORCUPINE_KEY,
-            keywords=WAKE_WORD,
-            sensitivities=[0.7]  # Higher = more sensitive (default 0.5)
-        )
+        self.porcupine = pvporcupine.create(access_key=PORCUPINE_KEY, keywords=WAKE_WORD, sensitivities=[0.7])
         logger.info("✓ Porcupine loaded")
 
-        # Initialize Vosk STT
-        logger.info("Initializing OpenAI Whisper client...")
-        self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("✓ Whisper API ready")
-
-        # Initialize Piper TTS
+        # TTS
         logger.info("Loading Piper TTS model...")
-        self.tts_voice = PiperVoice.load(PIPER_MODEL_PATH)
+        tts_voice = PiperVoice.load(PIPER_MODEL_PATH)
         logger.info("✓ Piper TTS loaded")
 
-        # Open microphone
-        logger.info(f"Opening microphone via arecord: {AUDIO_DEVICE}")
+        # Speaker (uses TTS + Spotify + LEDs)
+        self.speaker = Speaker(tts_voice, self.spotify, self.leds)
+        self.speaker.realtime_active_check = lambda: self.realtime_session_active
+
+        # Microphone
+        logger.info(f"Opening microphone: {AUDIO_DEVICE}")
         self.mic_proc = subprocess.Popen(
             ["arecord", "-D", AUDIO_DEVICE, "-f", "S16_LE", "-c", "2",
              "-r", str(self.porcupine.sample_rate), "-t", "raw"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0
         )
         self.mic_frame_bytes = self.porcupine.frame_length * 2 * 2
-        logger.info("\u2713 Microphone ready (arecord subprocess)")
+        logger.info("✓ Microphone ready")
 
-        # Moneo session
+        # Tools
         self.session_id = f"oracle-{int(time.time())}"
-        logger.info(f"✓ Session ID: {self.session_id}")
+        self.tools = ToolHandler(MONEO_API_URL, MONEO_API_KEY, self.spotify, self.session_id)
+        logger.info("✓ Tool handler ready")
 
-        # Conversation history for multi-turn conversations
-        self.conversation_history = []
-        self.conversation_timeout = 300  # 5 minutes
-        self.last_interaction = 0
-        logger.info("✓ Conversation tracking initialized (5min timeout)")
+        # Announcement FIFO
+        self.fifo_path = '/tmp/oracle_announce.fifo'
 
-        # Threads
-        self.spotify_monitor_thread = None
-        self.wake_word_thread = None
-
-        # Ensure volume is at good level on startup
-        current_vol = self.get_current_volume()
+        # Volume check
+        current_vol = self.spotify.get_volume()
         if current_vol < 80:
             logger.info(f"📢 Resetting volume from {current_vol} to 127")
-            self.set_volume(127)
-        else:
-            logger.info(f"✓ Volume OK: {current_vol}")
-        
+            self.spotify.set_volume(127)
+
         logger.info("✓ Oracle Master Service initialized")
         logger.info("=" * 60)
-    # ==================== VOLUME DUCKING ====================
 
-    def get_current_volume(self):
-        try:
-            result = subprocess.run(
-                ["amixer", "-c", "3", "get", "Headphone"],
-                capture_output=True,
-                text=True,
-                timeout=1
-            )
-            match = re.search(r"Playback (\d+)", result.stdout)
-            if match:
-                return int(match.group(1))
-            return 127
-        except:
-            return 127
+    # ==================== MIC CONTROL ====================
 
-    def set_volume(self, volume):
-        try:
-            subprocess.run(
-                ["amixer", "-c", "3", "set", "Headphone", str(volume)],
-                capture_output=True,
-                timeout=1
-            )
-            logger.debug(f"Volume set to {volume}")
-        except Exception as e:
-            logger.error(f"Failed to set volume: {e}")
+    def _mute_mic(self):
+        if hasattr(self, 'mic_proc') and self.mic_proc and self.mic_proc.poll() is None:
+            self.mic_proc.terminate()
+            self.mic_proc.wait(timeout=2)
+            logger.info("[Mic] Muted")
 
-    def duck_volume(self):
-        current_vol = self.get_current_volume()
-        
-        # Sanity check: if volume is suspiciously low, reset it first
-        if current_vol < 50:
-            logger.warning(f"⚠️  Volume too low ({current_vol}), resetting to 127")
-            self.set_volume(127)
-            current_vol = 127
-        
-        self.original_volume = current_vol
-        
-        # Calculate duck level with absolute minimum
-        duck_level = int(current_vol * 0.15)
-        duck_level = max(duck_level, 15)  # Never below 15 (audible)
-        
-        self.set_volume(duck_level)
-        logger.info(f"🔉 Volume ducked: {self.original_volume} → {duck_level}")
+    def _unmute_mic(self):
+        self.mic_proc = subprocess.Popen(
+            ["arecord", "-D", AUDIO_DEVICE, "-f", "S16_LE", "-c", "2",
+             "-r", str(self.porcupine.sample_rate), "-t", "raw"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0
+        )
+        logger.info("[Mic] Unmuted")
 
-    def restore_volume(self):
-        if hasattr(self, "original_volume"):
-            self.set_volume(self.original_volume)
-            logger.info(f"🔊 Volume restored: {self.original_volume}")
+    # ==================== WAKE WORD ====================
 
-
-
-    # ==================== SPOTIFY PLAYBACK CONTROL ====================
-
-    def pause_spotify(self):
-        try:
-            # Stop Raspotify service to release audio device
-            subprocess.run(['systemctl', 'stop', 'raspotify'], capture_output=True, timeout=3)
-            logger.info('⏸️  Raspotify stopped for TTS')
-            return True
-        except Exception as e:
-            logger.error(f'Failed to stop Raspotify: {e}')
-            return False
-
-    def resume_spotify(self):
-        try:
-            # Restart Raspotify service
-            subprocess.run(['systemctl', 'start', 'raspotify'], capture_output=True, timeout=5)
-            logger.info('▶️  Raspotify restarted')
-            return True
-        except Exception as e:
-            logger.error(f'Failed to restart Raspotify: {e}')
-            return False
-    # ==================== SPOTIFY MONITORING ====================
-
-    def check_spotify_status(self):
-        """Check if Spotify (Raspotify) is currently playing"""
-        try:
-            # Check if librespot process is running
-            result = subprocess.run(
-                ['pgrep', '-x', 'librespot'],
-                capture_output=True,
-                timeout=1
-            )
-            
-            # If librespot is running, Spotify is connected
-            # We assume MUSIC state when connected (visual feedback always on)
-            return result.returncode == 0
-
-        except Exception as e:
-            logger.debug(f"Spotify check error: {e}")
-            return False
-
-    def monitor_spotify_loop(self):
-        """Background thread: Monitor Spotify and update LED state"""
-        logger.info("[Spotify Monitor] Thread started")
-        last_state = None
-
-        while self.running:
-            try:
-                is_playing = self.check_spotify_status()
-
-                # State change detected
-                if is_playing != last_state:
-                    if is_playing and not self.in_voice_interaction:
-                        logger.info("🎵 Spotify started - switching to MUSIC state")
-                        self.leds.set_state('MUSIC')
-                        self.spotify_playing = True
-                    elif not is_playing and self.leds.current_state == 'MUSIC':
-                        logger.info("⏸️  Spotify stopped - returning to IDLE")
-                        self.leds.set_state('IDLE')
-                        self.spotify_playing = False
-
-                    last_state = is_playing
-
-                time.sleep(2)  # Check every 2 seconds
-
-            except Exception as e:
-                logger.error(f"[Spotify Monitor] Error: {e}")
-                time.sleep(5)
-
-        logger.info("[Spotify Monitor] Thread stopped")
-
-    # ==================== WAKE WORD DETECTION ====================
-
-    def wake_word_detection_loop(self):
-        """Background thread: Listen for wake word (even during music)"""
+    def wake_word_loop(self):
+        """Background thread: Listen for wake word (even during music)."""
         logger.info(f"[Wake Word] Thread started - listening for '{WAKE_WORD[0].upper()}'")
+        logger.info("[Wake Word] Entering read loop...")
         frame_count = 0
 
-        logger.info("[Wake Word] Entering read loop...")
         while self.running:
             try:
-                # Read from mic pipe, handling mic kill/restart during sessions
                 try:
                     mic_fd = self.mic_proc.stdout.fileno()
                 except (ValueError, AttributeError, OSError):
-                    # Mic was killed, wait for restart
-                    time.sleep(0.1)
-                    continue
+                    time.sleep(0.1); continue
 
                 data = b''
                 while len(data) < self.mic_frame_bytes:
-                    try:
-                        chunk = os.read(mic_fd, self.mic_frame_bytes - len(data))
-                    except OSError:
-                        chunk = b''
-                    if not chunk:
-                        # Pipe closed (mic was killed) - wait for restart
-                        time.sleep(0.1)
-                        break
+                    try: chunk = os.read(mic_fd, self.mic_frame_bytes - len(data))
+                    except OSError: chunk = b''
+                    if not chunk: time.sleep(0.1); break
                     data += chunk
-                if len(data) < self.mic_frame_bytes:
-                    continue
-                length = self.porcupine.frame_length
+                if len(data) < self.mic_frame_bytes: continue
 
+                length = self.porcupine.frame_length
                 if length > 0:
                     frame_count += 1
                     if frame_count % 200 == 1:
-                        import numpy as _np
-                        _s = _np.frombuffer(data[:80], dtype=_np.int16)
-                        _rms = _np.sqrt(_np.mean(_s.astype(float)**2))
-                        logger.info(f"[Wake Word] Frame {frame_count}, RMS={_rms:.0f}")
+                        _s = np.frombuffer(data[:80], dtype=np.int16)
+                        logger.info(f"[Wake Word] Frame {frame_count}, RMS={np.sqrt(np.mean(_s.astype(float)**2)):.0f}")
 
-                    # If Realtime session active, feed audio there
-                    if self.realtime_session_active and self.current_session:
-                        self.current_session.feed_audio(length, data)
-                        continue
-
-                    # Convert stereo to mono
+                    # Stereo -> mono for Porcupine
                     audio = struct.unpack(f'{length * 2}h', data)
                     mono = [int((audio[i] + audio[i+1]) / 2) for i in range(0, len(audio), 2)]
+
+                    # Feed audio to active Realtime session
+                    if self.realtime_session_active and self.current_session:
+                        self.current_session.feed_audio(length, data)
 
                     if len(mono) >= self.porcupine.frame_length:
                         pcm = mono[:self.porcupine.frame_length]
                         keyword_index = self.porcupine.process(pcm)
-
                         if keyword_index >= 0:
-                            logger.info(f"🔊 WAKE WORD DETECTED at {datetime.now().strftime('%H:%M:%S')}")
-                            self.handle_wake_word()
+                            if self.realtime_session_active and self.current_session and self.current_session._is_responding:
+                                logger.info(f"🔊 INTERRUPT via wake word at {datetime.now().strftime('%H:%M:%S')}")
+                                self.current_session.interrupt()
+                            elif not self.realtime_session_active:
+                                logger.info(f"🔊 WAKE WORD DETECTED at {datetime.now().strftime('%H:%M:%S')}")
+                                self.handle_wake_word()
 
-            except alsaaudio.ALSAAudioError:
-                continue
             except Exception as e:
                 logger.error(f"[Wake Word] Error: {e}")
                 time.sleep(0.1)
 
-        logger.info("[Wake Word] Thread stopped")
-
-    @staticmethod
-    def _generate_chime():
-        """Generate a two-tone chime (ascending, ~400ms, stereo)."""
-        import numpy as _np
-        rate = 44100
-        t1 = _np.linspace(0, 0.2, int(rate * 0.2), False)
-        t2 = _np.linspace(0, 0.2, int(rate * 0.2), False)
-        tone1 = (_np.sin(2 * _np.pi * 800 * t1) * 30000).astype(_np.int16)
-        tone2 = (_np.sin(2 * _np.pi * 1200 * t2) * 30000).astype(_np.int16)
-        fade = _np.linspace(0, 1, len(tone1) // 4)
-        tone1[:len(fade)] = (tone1[:len(fade)] * fade).astype(_np.int16)
-        tone1[-len(fade):] = (tone1[-len(fade):] * fade[::-1]).astype(_np.int16)
-        tone2[:len(fade)] = (tone2[:len(fade)] * fade).astype(_np.int16)
-        tone2[-len(fade):] = (tone2[-len(fade):] * fade[::-1]).astype(_np.int16)
-        mono = _np.concatenate([tone1, tone2])
-        stereo = _np.empty(len(mono) * 2, dtype=_np.int16)
-        stereo[0::2] = mono
-        stereo[1::2] = mono
-        return stereo.tobytes()
-
-    @staticmethod
-    def _generate_end_chime():
-        """Generate a two-tone chime (descending, ~400ms, stereo, loud)."""
-        import numpy as _np
-        rate = 44100
-        t1 = _np.linspace(0, 0.2, int(rate * 0.2), False)
-        t2 = _np.linspace(0, 0.2, int(rate * 0.2), False)
-        tone1 = (_np.sin(2 * _np.pi * 1200 * t1) * 30000).astype(_np.int16)
-        tone2 = (_np.sin(2 * _np.pi * 800 * t2) * 30000).astype(_np.int16)
-        fade = _np.linspace(0, 1, len(tone1) // 4)
-        tone1[:len(fade)] = (tone1[:len(fade)] * fade).astype(_np.int16)
-        tone1[-len(fade):] = (tone1[-len(fade):] * fade[::-1]).astype(_np.int16)
-        tone2[:len(fade)] = (tone2[:len(fade)] * fade).astype(_np.int16)
-        tone2[-len(fade):] = (tone2[-len(fade):] * fade[::-1]).astype(_np.int16)
-        mono = _np.concatenate([tone1, tone2])
-        stereo = _np.empty(len(mono) * 2, dtype=_np.int16)
-        stereo[0::2] = mono
-        stereo[1::2] = mono
-        return stereo.tobytes()
-
-    def _mute_mic(self):
-        """Kill arecord to prevent echo during Oracle speech."""
-        if hasattr(self, 'mic_proc') and self.mic_proc and self.mic_proc.poll() is None:
-            self.mic_proc.terminate()
-            self.mic_proc.wait(timeout=2)
-            logger.info("[Mic] Muted (arecord killed)")
-
-    def _unmute_mic(self):
-        """Restart arecord after Oracle finishes speaking."""
-        import subprocess as _sp
-        self.mic_proc = _sp.Popen(
-            ["arecord", "-D", AUDIO_DEVICE, "-f", "S16_LE", "-c", "2",
-             "-r", str(self.porcupine.sample_rate), "-t", "raw"],
-            stdout=_sp.PIPE,
-            stderr=_sp.DEVNULL,
-            bufsize=0
-        )
-        logger.info("[Mic] Unmuted (arecord restarted)")
-
     def handle_wake_word(self):
-        """Handle wake word - start Realtime API conversation (non-blocking).
-
-        Must NOT block the wake word thread, since that thread reads the mic
-        and feeds audio to the Realtime session.
-        """
+        """Start Realtime API conversation (non-blocking)."""
         logger.info("[Realtime] Starting conversation session...")
-
-        # Track state
         self.realtime_session_active = True
-        self._spotify_was_playing = self.spotify_playing
+        self._spotify_was_playing = self.spotify.playing
 
-        # Pause Spotify if playing
         if self._spotify_was_playing:
-            self.pause_spotify()
+            self.spotify.pause()
 
-        # Confirmation sound + set listening state
         self.leds.set_state("LISTENING")
-        try:
-            # Play a short confirmation tone so user knows Oracle heard them
-            subprocess.Popen(
-                ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            ).communicate(input=self._generate_chime(), timeout=2)
-        except Exception:
-            pass
+        play_chime(ascending=True)
 
-        # Create Realtime API session
+        def _check_briefing_request(transcript):
+            """Check if user asked for briefing and switch to dedicated session."""
+            lower = transcript.lower()
+            if any(kw in lower for kw in ["briefing", "breathing", "morning brief", "morning breath", "check-in", "check in", "daily brief"]):
+                logger.info("[Realtime] Briefing request detected in transcript - switching to check-in")
+                self.tools._briefing_requested = True
+                if self.current_session:
+                    self.current_session.active = False  # Kill current session
+
         session = OracleRealtimeSession(
             api_key=OPENAI_API_KEY,
             system_prompt=ORACLE_SYSTEM_PROMPT,
             tools=REALTIME_TOOLS,
-            tool_handler=self.handle_tool_call,
+            tool_handler=self.tools.handle,
             on_speech_started=lambda: self.leds.set_state("LISTENING"),
             on_speech_ended=lambda: self.leds.set_state("THINKING"),
             on_audio_started=lambda: self.leds.set_state("SPEAKING"),
@@ -677,40 +593,33 @@ class OracleMasterService:
             on_error=lambda msg: logger.error(f"[Realtime] Error: {msg}"),
             on_mic_mute=self._mute_mic,
             on_mic_unmute=self._unmute_mic,
-            session_timeout=4
+            on_user_transcript=_check_briefing_request,
+            session_timeout=20
         )
-
         self.current_session = session
         session.start()
 
-        # Monitor session end in a separate thread (don't block wake word thread)
-        def _monitor_session():
+        def _monitor():
             while session.active and self.running:
                 time.sleep(0.1)
-
-            # Cleanup
             self.current_session = None
             self.realtime_session_active = False
+
+            # Check if briefing was requested during this session
+            briefing_requested = getattr(self.tools, '_briefing_requested', False)
+            if briefing_requested:
+                self.tools._briefing_requested = False
+                logger.info("[Realtime] Briefing requested - switching to check-in session")
+                time.sleep(1)
+                self._deliver_briefing()
+                return
+
             logger.info("[Realtime] Session ended, waiting for speaker cleanup...")
-            time.sleep(2)  # Wait for Realtime session aplay to fully close
-
-            # Play end chime (descending tone)
+            time.sleep(2)
             logger.info("[Realtime] Playing end chime")
-            try:
-                p = subprocess.Popen(
-                    ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
-                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                )
-                _, err = p.communicate(input=self._generate_end_chime(), timeout=3)
-                if p.returncode != 0:
-                    logger.error(f"[Realtime] End chime failed (exit {p.returncode}): {err.decode()[:100] if err else 'no error'}")
-                else:
-                    logger.info("[Realtime] End chime played OK")
-            except Exception as e:
-                logger.error(f"[Realtime] End chime exception: {e}")
-
+            play_chime(ascending=False)
             if self._spotify_was_playing:
-                self.resume_spotify()
+                self.spotify.resume()
                 time.sleep(1)
                 self.leds.set_state("MUSIC")
                 logger.info("Returned to MUSIC state")
@@ -718,419 +627,129 @@ class OracleMasterService:
                 self.leds.set_state("IDLE")
                 logger.info("Returned to IDLE state")
 
-        monitor = threading.Thread(target=_monitor_session, daemon=True)
-        monitor.start()
+        threading.Thread(target=_monitor, daemon=True).start()
 
-        # Return immediately - wake word thread keeps running and feeds audio
-
-    def record_voice_command(self):
-        """Record audio after wake word"""
-        logger.info(f"🎙️  Recording for {RECORD_SECONDS} seconds...")
-
-        frames = []
-        num_frames = int(SAMPLE_RATE / self.porcupine.frame_length * RECORD_SECONDS)
-
-        for i in range(num_frames):
-            try:
-                data = self.mic_proc.stdout.read(self.mic_frame_bytes)
-                if data and len(data) >= self.mic_frame_bytes:
-                    frames.append(data)
-                else:
-                    time.sleep(0.01)
-            except Exception:
-                continue
-
-        wav_file = "/tmp/oracle_command.wav"
-        with wave.open(wav_file, 'wb') as wf:
-            wf.setnchannels(2)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b''.join(frames))
-
-        logger.info("✓ Recording complete")
-        return wav_file
-
-    def transcribe(self, audio_file):
-        """Transcribe audio using OpenAI Whisper API"""
-        logger.info("🤖 Transcribing with Whisper API...")
-
-        try:
-            with open(audio_file, "rb") as f:
-                response = self.openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    language="en"
-                )
-            transcription = response.text.strip()
-            logger.info(f"📝 USER SAID: '{transcription}'")
-            return transcription
-        except Exception as e:
-            logger.error(f"Whisper API error: {e}")
-            return ""
-
-    # ==================== AI INTEGRATION ====================
-
-    def query_ai(self, user_message):
-        '''Send message to Moneo Core API with conversation history'''
-        logger.info('Querying Moneo Core: http://100.71.119.36:3002/api/voice/chat')
-        self.leds.set_state('THINKING')
-
-        # Check if conversation has expired
-        current_time = time.time()
-        if current_time - self.last_interaction > self.conversation_timeout:
-            if len(self.conversation_history) > 0:
-                logger.info(f'💭 Conversation expired ({len(self.conversation_history)} turns cleared)')
-            self.conversation_history = []
-
-        # Add user message to history
-        self.conversation_history.append({
-            'role': 'user',
-            'content': user_message,
-            'timestamp': current_time
-        })
-
-        # Log conversation context
-        if len(self.conversation_history) > 1:
-            logger.info(f'💭 Multi-turn conversation ({len(self.conversation_history)//2} turns)')
-
-        try:
-            response = requests.post(
-                'http://100.71.119.36:3002/api/voice/chat',
-                headers={
-                    'X-API-Key': MONEO_API_KEY,
-                    'Content-Type': 'application/json'
-                },
-                json={
-                    'text': user_message + ' (Keep response to 1-2 short sentences, no stage directions or asterisks)',
-                    'history': self.conversation_history[-10:],  # Last 5 turns (10 messages)
-                    'sessionId': self.session_id,
-                    'userId': 'trevor'
-                },
-                timeout=30
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                response_text = data.get('text', '')
-
-                # Add response to history
-                self.conversation_history.append({
-                    'role': 'assistant',
-                    'content': response_text,
-                    'timestamp': time.time()
-                })
-
-                # Update last interaction time
-                self.last_interaction = time.time()
-
-                return response_text
-            else:
-                logger.error(f'Moneo API error: {response.status_code}')
-                return ''
-
-        except Exception as e:
-            logger.error(f'Moneo API error: {e}')
-            return ''
-    
-    def speak(self, text):
-        logger.info('🔊 Speaking...')
-        # Strip stage directions (text between asterisks)
-        text = re.sub(r'\*[^*]+\*', '', text)
-        # Clean up extra whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        logger.info(f'TTS text ({len(text)} chars): {text[:100]}...')
-        self.leds.set_state('SPEAKING')
-
-        spotify_was_playing = self.spotify_playing
-        if spotify_was_playing:
-            self.pause_spotify()
-            # Restore volume for TTS (Spotify is stopped, so duck doesn't apply)
-            if hasattr(self, 'original_volume') and self.original_volume:
-                self.set_volume(self.original_volume)
-                logger.info(f'🔊 Volume restored to {self.original_volume} for TTS')
-            import time
-            time.sleep(0.5)  # Give it more time to fully stop
-
-        try:
-            # Generate all TTS audio first
-            logger.info('Generating TTS audio...')
-            audio_data = b''
-            for audio_chunk in self.tts_voice.synthesize(text):
-                audio_data += audio_chunk.audio_int16_bytes
-            
-            audio_size_kb = len(audio_data) / 1024
-            duration_sec = len(audio_data) / (22050 * 2)
-            logger.info(f'✓ TTS generated: {audio_size_kb:.1f}KB, ~{duration_sec:.1f}s')
-            
-            # Play audio via aplay
-            logger.info('Playing audio via aplay...')
-            aplay_process = subprocess.Popen(
-                ['aplay', '-D', AUDIO_DEVICE, '-r', '22050', '-f', 'S16_LE', '-c', '1'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
-            )
-            
-            stdout, stderr = aplay_process.communicate(input=audio_data, timeout=60)
-            
-            if aplay_process.returncode == 0:
-                logger.info('✓ Speech playback complete')
-            else:
-                err_msg = stderr.decode() if stderr else 'unknown error'
-                logger.error(f'aplay failed (code {aplay_process.returncode}): {err_msg}')
-        except subprocess.TimeoutExpired:
-            logger.error('TTS playback timed out after 60 seconds')
-            aplay_process.kill()
-        except Exception as e:
-            logger.error(f'TTS error: {e}')
-            import traceback
-            logger.error(traceback.format_exc())
-        finally:
-            if spotify_was_playing:
-                import time
-                time.sleep(1.0)
-                self.resume_spotify()
+    # ==================== FIFO ANNOUNCEMENTS ====================
 
     def fifo_reader_loop(self):
-        """Read scheduled announcements from FIFO (from oracle_scheduler)"""
-        logger.info('[FIFO Reader] Thread started - listening for scheduled announcements')
-
+        """Background thread: Read announcements from scheduler FIFO."""
+        logger.info('[FIFO Reader] Thread started')
         while self.running:
             try:
-                # Recreate FIFO if it doesn't exist
                 if not os.path.exists(self.fifo_path):
-                    try:
-                        os.mkfifo(self.fifo_path)
-                        logger.info(f'Created FIFO: {self.fifo_path}')
-                    except OSError as e:
-                        logger.error(f'Failed to create FIFO: {e}')
-                        time.sleep(5)
-                        continue
+                    try: os.mkfifo(self.fifo_path)
+                    except OSError: time.sleep(5); continue
 
-                # Open FIFO for reading (blocking until writer connects)
-                logger.debug('Waiting for FIFO writer...')
                 with open(self.fifo_path, 'r') as fifo:
                     while self.running:
                         line = fifo.readline()
-                        if not line:
-                            break  # Writer closed, reopen FIFO
-
+                        if not line: break
                         line = line.strip()
-                        if not line:
-                            continue
-
+                        if not line: continue
                         try:
-                            # Parse JSON message
-                            message = json.loads(line)
-                            text = message.get('text', '')
-                            priority = message.get('priority', 'medium')
-
-                            if not text:
-                                continue
-
-                            logger.info(f'[FIFO] Received announcement ({priority}): {text[:100]}...')
-
-                            # Process based on priority
-                            if priority == 'urgent':
-                                self.process_announcement_urgent(text)
-                            elif priority == 'medium':
-                                self.process_announcement_medium(text)
-                            else:
-                                self.process_announcement_low(text)
-
+                            msg = json.loads(line)
+                            text = msg.get('text', '')
+                            priority = msg.get('priority', 'medium')
+                            if not text: continue
+                            logger.info(f'[FIFO] Received ({priority}): {text[:100]}...')
+                            self._announce(text, priority)
                         except json.JSONDecodeError as e:
                             logger.error(f'[FIFO] Invalid JSON: {line} - {e}')
-                        except Exception as e:
-                            logger.error(f'[FIFO] Error processing message: {e}')
-
             except Exception as e:
                 logger.error(f'[FIFO Reader] Error: {e}')
                 time.sleep(5)
 
-    def process_announcement_urgent(self, text):
-        """Interrupt immediately"""
-        logger.info('[Announcement] URGENT - interrupting immediately')
-        self.in_voice_interaction = True
-        self.speak(text)
-        self.in_voice_interaction = False
+    def _announce(self, text, priority):
+        """Route announcement based on priority. For reminders, open a listen session after."""
+        is_reminder = text.lower().startswith('reminder')
 
-    def process_announcement_medium(self, text):
-        """Duck music and announce"""
-        if self.in_voice_interaction:
-            logger.info('[Announcement] MEDIUM - waiting for conversation to finish')
-            start_time = time.time()
-            while self.in_voice_interaction and (time.time() - start_time) < 60:
-                time.sleep(1)
+        if priority == 'urgent':
+            self.in_voice_interaction = True
+            self.speaker.speak(text)
+            self.in_voice_interaction = False
+        elif priority == 'medium':
+            if self.in_voice_interaction or self.realtime_session_active:
+                logger.info('[Announcement] Waiting for conversation to finish')
+                start = time.time()
+                while (self.in_voice_interaction or self.realtime_session_active) and (time.time() - start) < 60:
+                    time.sleep(1)
+            self.speaker.speak(text)
+        else:  # low
+            start = time.time()
+            while (self.spotify.playing or self.in_voice_interaction) and (time.time() - start) < 300:
+                time.sleep(5)
+            self.speaker.speak(text)
 
-        logger.info('[Announcement] MEDIUM - speaking over music')
-        self.speak(text)
+        # After a reminder, open a brief Realtime session so Trevor can dismiss/snooze
+        # without needing to say the wake word again
+        if is_reminder and not self.realtime_session_active:
+            logger.info("[Reminder] Opening listen session for acknowledgment...")
+            self._open_reminder_listen_session()
 
-    def process_announcement_low(self, text):
-        """Wait for silence"""
-        logger.info('[Announcement] LOW - waiting for silence')
-        start_time = time.time()
-        while (self.spotify_playing or self.in_voice_interaction) and (time.time() - start_time) < 300:
-            time.sleep(5)
+    def _open_reminder_listen_session(self):
+        """Open a short Realtime session after a reminder fires so Trevor can respond immediately."""
+        if self.realtime_session_active:
+            return
 
-        if time.time() - start_time >= 300:
-            logger.warning('[Announcement] LOW - timeout waiting for silence, speaking anyway')
+        self.realtime_session_active = True
+        self._spotify_was_playing = self.spotify.playing
+        if self._spotify_was_playing:
+            self.spotify.pause()
 
-        logger.info('[Announcement] LOW - speaking in silence')
-        self.speak(text)
+        self.leds.set_state("LISTENING")
 
+        reminder_prompt = ORACLE_SYSTEM_PROMPT + """
 
-    # ==================== AUDIO BRIDGE ====================
-
-    def _briefing_scheduler_loop(self):
-        """Check every minute if it's time for the morning briefing (10 AM ET)."""
-        from datetime import datetime as _dt
-        import pytz
-        delivered_today = False
-        et = pytz.timezone("America/New_York")
-
-        logger.info("[Briefing] Scheduler started - delivery at 10:00 AM ET")
-
-        while self.running:
-            try:
-                now = _dt.now(et)
-
-                # Reset flag at midnight
-                if now.hour == 0 and now.minute == 0:
-                    delivered_today = False
-
-                # Deliver at 10:00 AM ET (weekdays only)
-                if now.hour == 10 and now.minute == 0 and now.weekday() < 5 and not delivered_today:
-                    logger.info("[Briefing] 10:00 AM ET - delivering morning briefing")
-                    delivered_today = True
-                    self._deliver_morning_briefing()
-
-                time.sleep(30)  # Check every 30 seconds
-            except Exception as e:
-                logger.error(f"[Briefing] Scheduler error: {e}")
-                time.sleep(60)
-
-    def _deliver_morning_briefing(self):
-        """Auto-deliver morning briefing via Realtime API session."""
-        logger.info("[Briefing] Starting briefing delivery...")
-
-        try:
-            # Fetch briefing text
-            response = requests.get(
-                "http://100.71.119.36:3002/api/voice/briefing/today",
-                headers={"X-API-Key": MONEO_API_KEY},
-                timeout=10
-            )
-
-            if response.status_code == 404:
-                # Generate on the fly
-                logger.info("[Briefing] No pre-generated briefing, generating now...")
-                response = requests.post(
-                    "http://100.71.119.36:3002/api/voice/briefing/generate",
-                    headers={"X-API-Key": MONEO_API_KEY},
-                    timeout=60
-                )
-                if response.status_code != 200:
-                    logger.error("[Briefing] Generation failed")
-                    return
-                script = response.json().get("briefing", {}).get("script", "")
-            elif response.status_code == 200:
-                script = response.json().get("script", "")
-            else:
-                logger.error(f"[Briefing] API returned {response.status_code}")
-                return
-
-            if not script:
-                logger.error("[Briefing] Empty briefing script")
-                return
-
-            # Deliver via Realtime API session (same as wake word but auto-triggered)
-            self.realtime_session_active = True
-            self._spotify_was_playing = self.spotify_playing
-
-            if self._spotify_was_playing:
-                self.pause_spotify()
-
-            self.leds.set_state("SPEAKING")
-
-            # Play start chime
-            try:
-                subprocess.Popen(
-                    ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
-                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                ).communicate(input=self._generate_chime(), timeout=2)
-            except Exception:
-                pass
-
-            briefing_prompt = ORACLE_SYSTEM_PROMPT + f"""
-
-MORNING BRIEFING MODE:
-You have a pre-generated morning briefing to deliver. Read it to Trevor naturally, exactly as written.
-After reading the briefing, ask if he has any questions about anything mentioned.
-
-THE BRIEFING:
-{script}
+REMINDER ACKNOWLEDGMENT MODE:
+A reminder just fired and was spoken to Trevor. He can now respond.
+If he says 'got it', 'ok', 'dismiss', 'done', 'thanks', or anything that sounds like acknowledgment, call dismiss_reminder with reminder_index -1.
+If he says 'snooze' or 'remind me again in X minutes', call snooze_reminder.
+If he says something unrelated, just respond normally.
+If he doesn't say anything, the session will time out and that's fine.
 """
 
-            session = OracleRealtimeSession(
-                api_key=OPENAI_API_KEY,
-                system_prompt=briefing_prompt,
-                tools=REALTIME_TOOLS,
-                tool_handler=self.handle_tool_call,
-                on_speech_started=lambda: self.leds.set_state("LISTENING"),
-                on_speech_ended=lambda: self.leds.set_state("THINKING"),
-                on_audio_started=lambda: self.leds.set_state("SPEAKING"),
-                on_response_done=lambda: None,
-                on_error=lambda msg: logger.error(f"[Briefing] Error: {msg}"),
-                on_mic_mute=self._mute_mic,
-                on_mic_unmute=self._unmute_mic,
-                session_timeout=4
-            )
+        session = OracleRealtimeSession(
+            api_key=OPENAI_API_KEY,
+            system_prompt=reminder_prompt,
+            tools=REALTIME_TOOLS,
+            tool_handler=self.tools.handle,
+            on_speech_started=lambda: self.leds.set_state("LISTENING"),
+            on_speech_ended=lambda: self.leds.set_state("THINKING"),
+            on_audio_started=lambda: self.leds.set_state("SPEAKING"),
+            on_response_done=lambda: None,
+            on_error=lambda msg: logger.error(f"[Reminder Listen] Error: {msg}"),
+            on_mic_mute=self._mute_mic,
+            on_mic_unmute=self._unmute_mic,
+            session_timeout=8  # Slightly longer timeout for acknowledgment
+        )
+        self.current_session = session
+        session.start()
+        logger.info("[Reminder Listen] Session open — waiting for Trevor's response")
 
-            self.current_session = session
-            session.start()
-
-            # Wait for session to end
+        def _monitor():
             while session.active and self.running:
                 time.sleep(0.1)
-
             self.current_session = None
             self.realtime_session_active = False
-
-            # End chime
+            logger.info("[Reminder Listen] Session ended")
             time.sleep(2)
-            try:
-                subprocess.Popen(
-                    ['aplay', '-D', 'plughw:2,0', '-f', 'S16_LE', '-c', '2', '-r', '44100', '-t', 'raw'],
-                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                ).communicate(input=self._generate_end_chime(), timeout=3)
-            except Exception:
-                pass
-
+            play_chime(ascending=False)
             if self._spotify_was_playing:
-                self.resume_spotify()
+                self.spotify.resume()
+                time.sleep(1)
                 self.leds.set_state("MUSIC")
             else:
                 self.leds.set_state("IDLE")
 
-            logger.info("[Briefing] Delivery complete")
+        threading.Thread(target=_monitor, daemon=True).start()
 
-        except Exception as e:
-            logger.error(f"[Briefing] Delivery error: {e}")
-            self.realtime_session_active = False
+    # ==================== AUDIO BRIDGE ====================
 
     def audio_bridge_loop(self):
-        """Capture audio from loopback and feed visualization buffer.
+        """Background thread: Feed audio visualization buffer from FIFO."""
+        FIFO_PATH = '/tmp/oracle_audio_fifo'
+        CHUNK_BYTES = 1024 * 2 * 2
 
-        Speaker output is handled by the external oracle-audio-bridge service
-        (arecord|aplay) because the WM8960 can't handle simultaneous
-        mic capture and aplay playback from the same process.
-        """
-        logger.info("[Audio Bridge] Starting loopback capture for visualization...")
-
-        capture = None
-
-        # Set WM8960 volumes on startup
         try:
             subprocess.run(['amixer', '-c', '4', 'sset', 'Headphone', '127'], capture_output=True, timeout=2)
             subprocess.run(['amixer', '-c', '4', 'sset', 'Speaker', '127'], capture_output=True, timeout=2)
@@ -1139,496 +758,189 @@ THE BRIEFING:
         except Exception as e:
             logger.warning(f"[Audio Bridge] Volume set failed: {e}")
 
+        logger.info(f"[Audio Bridge] Waiting for FIFO at {FIFO_PATH}...")
         while self.running:
             try:
-                # Open loopback capture if needed
-                if capture is None:
-                    capture = alsaaudio.PCM(
-                        alsaaudio.PCM_CAPTURE,
-                        alsaaudio.PCM_NORMAL,
-                        device='plughw:2,1',
-                        channels=2,
-                        rate=44100,
-                        format=alsaaudio.PCM_FORMAT_S16_LE,
-                        periodsize=1024
-                    )
-                    logger.info("[Audio Bridge] Loopback capture opened (plughw:2,1)")
-
-                # Read audio from loopback
-                length, data = capture.read()
-
-                if length > 0:
-                    # Feed visualization buffer
-                    self.leds.audio_buffer.append((length, data))
-
-            except alsaaudio.ALSAAudioError as e:
-                logger.error(f"[Audio Bridge] ALSA error: {e}")
-                if capture:
-                    try: capture.close()
-                    except: pass
-                    capture = None
-                time.sleep(1)
+                if not os.path.exists(FIFO_PATH): time.sleep(0.5); continue
+                with open(FIFO_PATH, 'rb') as fifo:
+                    logger.info("[Audio Bridge] FIFO opened for visualization")
+                    while self.running:
+                        data = fifo.read(CHUNK_BYTES)
+                        if not data: break
+                        length = len(data) // (2 * 2)
+                        if length > 0: self.leds.audio_buffer.append((length, data))
             except Exception as e:
-                logger.error(f"[Audio Bridge] Error: {e}")
-                time.sleep(0.1)
+                logger.error(f"[Audio Bridge] FIFO error: {e}")
+                time.sleep(1)
 
-        # Cleanup
-        if capture:
-            try: capture.close()
-            except: pass
-        logger.info("[Audio Bridge] Stopped")
+    # ==================== BRIEFING SCHEDULER ====================
 
+    def briefing_loop(self):
+        """Background thread: Deliver morning briefing at 10 AM ET weekdays."""
+        delivered_today = False
+        logger.info("[Briefing] Scheduler started - delivery at 10:00 AM ET")
 
-    def handle_tool_call(self, name, args):
-        """Execute a tool call from the Realtime API."""
-        logger.info(f"[Tool] Executing: {name}")
-        if name == "spotify_play":
-            return self._tool_spotify_play(args.get("query", ""))
-        elif name == "spotify_control":
-            return self._tool_spotify_control(args.get("action", ""))
-        elif name == "moneo_query":
-            return self._tool_moneo_query(args.get("question", ""))
-        elif name == "debug_system":
-            return self._tool_debug_system(args.get("check", "all"))
-        elif name == "set_reminder":
-            return self._tool_set_reminder(
-                args.get("message", ""),
-                args.get("time", ""),
-                args.get("date", "today"),
-                args.get("priority", "medium")
-            )
-        elif name == "morning_briefing":
-            return self._tool_morning_briefing()
-        elif name == "get_calendar":
-            return self._tool_get_calendar(args.get("time_range", "today"))
-        elif name == "create_calendar_event":
-            return self._tool_create_calendar_event(args)
-        elif name == "send_email":
-            return self._tool_send_email(args)
-        elif name == "run_command":
-            return self._tool_run_command(args.get("command", ""))
-        else:
-            return {"error": f"Unknown tool: {name}"}
+        while self.running:
+            try:
+                now = datetime.now()
+                if now.hour == 0 and now.minute == 0:
+                    delivered_today = False
+                if now.hour == 10 and now.minute == 0 and now.weekday() < 5 and not delivered_today:
+                    logger.info("[Briefing] 10:00 AM ET - delivering morning briefing")
+                    delivered_today = True
+                    self._deliver_briefing()
+                time.sleep(30)
+            except Exception as e:
+                logger.error(f"[Briefing] Error: {e}")
+                time.sleep(60)
 
-    def _tool_spotify_play(self, query):
-        """Search and play music on Spotify."""
+    def _deliver_briefing(self):
+        """Deliver morning briefing via Piper TTS, then open Realtime API for Q&A."""
+        logger.info("[Briefing] Starting delivery...")
         try:
-            # Start Raspotify if not running
-            subprocess.run(['systemctl', 'start', 'raspotify'], capture_output=True, timeout=5)
+            # 1. Generate fresh briefing from Moneo (always regenerate for current data)
+            api_base = MONEO_API_URL.rsplit('/api/', 1)[0]
+            logger.info("[Briefing] Generating fresh briefing...")
+            response = requests.post(f"{api_base}/api/voice/briefing/generate",
+                                     headers={"X-API-Key": MONEO_API_KEY}, timeout=60)
+            if response.status_code != 200:
+                logger.error(f"[Briefing] Generation failed: {response.status_code}"); return
+            briefing_data = response.json().get("briefing", {})
+
+            script = briefing_data.get("script", "")
+            interview_questions = briefing_data.get("interviewQuestions", [])
+
+            if not script:
+                logger.error("[Briefing] Empty script"); return
+
+            # 2. Read briefing via Piper TTS (no AI, no hallucination)
+            self._spotify_was_playing = self.spotify.playing
+            if self._spotify_was_playing: self.spotify.pause()
+            play_chime(ascending=True)
+            time.sleep(0.5)
+
+            logger.info(f"[Briefing] Reading script via Piper TTS ({len(script)} chars)")
+            self.speaker.speak(script)
+            logger.info("[Briefing] TTS delivery complete")
+
+            # 3. Open Realtime API session for interactive Q&A
+            if interview_questions:
+                time.sleep(1)
+                logger.info(f"[Briefing] Starting Q&A session with {len(interview_questions)} questions")
+
+                question_list = "\n".join(f"{i+1}. {q}" for i, q in enumerate(interview_questions))
+                qa_prompt = f"""You are Oracle, Trevor Yahn's AI assistant. You just delivered his morning briefing via the speaker. Now conduct a brief check-in.
+
+Ask these questions ONE AT A TIME. Wait for Trevor's response before asking the next one:
+
+{question_list}
+
+CAPTURE RULES (CRITICAL — your main job during check-in):
+- When Trevor mentions something he needs to do: capture(type="task")
+- When Trevor commits to doing something today: capture(type="commitment")
+- When Trevor says something is DONE, FINISHED, or TAKEN CARE OF: capture(type="complete")
+- When Trevor shares a decision or context: capture(type="note")
+- Call capture for EVERY actionable thing Trevor says. Do not ask permission. Just save it and briefly confirm.
+- Do NOT use dismiss_reminder for task completions. Only use capture.
+
+CONVERSATION RULES:
+- Keep responses to 1-2 sentences. You are speaking out loud.
+- Do not repeat back what Trevor said unless confirming a capture.
+- Do not give motivational advice or platitudes.
+- Be direct and efficient like JARVIS.
+- Start by saying "That's your briefing. Let me check in on a few things."
+- After all questions, say a brief close-out and end."""
+
+                self.realtime_session_active = True
+                self.leds.set_state("SPEAKING")
+
+                session = OracleRealtimeSession(
+                    api_key=OPENAI_API_KEY, system_prompt=qa_prompt,
+                    tools=REALTIME_TOOLS, tool_handler=self.tools.handle,
+                    on_speech_started=lambda: self.leds.set_state("LISTENING"),
+                    on_speech_ended=lambda: self.leds.set_state("THINKING"),
+                    on_audio_started=lambda: self.leds.set_state("SPEAKING"),
+                    on_response_done=lambda: None,
+                    on_error=lambda msg: logger.error(f"[Briefing Q&A] Error: {msg}"),
+                    on_mic_mute=self._mute_mic, on_mic_unmute=self._unmute_mic,
+                    auto_start=True, session_timeout=30
+                )
+                self.current_session = session
+                session.start()
+
+                while session.active and self.running: time.sleep(0.1)
+                self.current_session = None
+                self.realtime_session_active = False
+
+                # Post-session: extract captures from transcript via Claude
+                if session.transcript:
+                    logger.info(f"[Briefing] Extracting captures from {len(session.transcript)} transcript entries")
+                    try:
+                        api_base = MONEO_API_URL.rsplit('/api/', 1)[0]
+                        extract_resp = requests.post(
+                            f"{api_base}/api/voice/checkin/extract",
+                            headers={"X-API-Key": MONEO_API_KEY, "Content-Type": "application/json"},
+                            json={"transcript": session.transcript},
+                            timeout=30
+                        )
+                        if extract_resp.status_code == 200:
+                            result = extract_resp.json()
+                            logger.info(f"[Briefing] Captured {result.get('captured', 0)} items from check-in")
+                        else:
+                            logger.error(f"[Briefing] Extract failed: {extract_resp.status_code}")
+                    except Exception as e:
+                        logger.error(f"[Briefing] Extract error: {e}")
+
             time.sleep(1)
-            return {
-                "status": "started",
-                "message": f"Raspotify is running. Tell Trevor to search for '{query}' in Spotify and select the Oracle speaker. Direct Spotify search-and-play will be added soon."
-            }
-        except Exception as e:
-            return {"error": str(e)}
+            play_chime(ascending=False)
 
-    def _tool_spotify_control(self, action):
-        """Control Spotify playback."""
-        try:
-            if action == "pause":
-                subprocess.run(['systemctl', 'stop', 'raspotify'], capture_output=True, timeout=3)
-                self.spotify_playing = False
-                return {"status": "paused"}
-            elif action == "resume":
-                subprocess.run(['systemctl', 'start', 'raspotify'], capture_output=True, timeout=5)
-                return {"status": "resumed"}
-            elif action in ("next", "previous"):
-                return {"status": "not_available", "message": f"'{action}' requires Spotify Web API - coming soon"}
+            if self._spotify_was_playing:
+                self.spotify.resume(); self.leds.set_state("MUSIC")
             else:
-                return {"error": f"Unknown action: {action}"}
+                self.leds.set_state("IDLE")
+            logger.info("[Briefing] Delivery complete")
         except Exception as e:
-            return {"error": str(e)}
+            logger.error(f"[Briefing] Error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.realtime_session_active = False
 
-    def _tool_moneo_query(self, question):
-        """Query Moneo Core API (Claude with full context)."""
-        try:
-            response = requests.post(
-                MONEO_API_URL,
-                headers={
-                    'X-API-Key': MONEO_API_KEY,
-                    'Content-Type': 'application/json'
-                },
-                json={
-                    'text': question + ' (Keep response to 2-3 short sentences)',
-                    'sessionId': self.session_id,
-                    'userId': 'trevor'
-                },
-                timeout=15
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return {"answer": data.get("text", "No response from Moneo")}
-            else:
-                return {"error": f"Moneo returned {response.status_code}"}
-        except requests.exceptions.Timeout:
-            return {"error": "Moneo API timed out"}
-        except Exception as e:
-            return {"error": str(e)}
-
-
-    def _tool_morning_briefing(self):
-        """Fetch and return the pre-generated morning briefing."""
-        try:
-            response = requests.get(
-                "http://100.71.119.36:3002/api/voice/briefing/today",
-                headers={"X-API-Key": MONEO_API_KEY},
-                timeout=10
-            )
-            if response.status_code == 200:
-                data = response.json()
-                script = data.get("script", "No briefing available.")
-                return {"briefing": script, "instruction": "Read this briefing to Trevor exactly as written. After reading, ask if he has any questions."}
-            elif response.status_code == 404:
-                # No briefing generated yet, try generating one now
-                gen_response = requests.post(
-                    "http://100.71.119.36:3002/api/voice/briefing/generate",
-                    headers={"X-API-Key": MONEO_API_KEY},
-                    timeout=30
-                )
-                if gen_response.status_code == 200:
-                    data = gen_response.json()
-                    script = data.get("briefing", {}).get("script", "Briefing generation succeeded but no script found.")
-                    return {"briefing": script, "instruction": "Read this briefing to Trevor exactly as written. After reading, ask if he has any questions."}
-                return {"error": "Could not generate briefing"}
-            else:
-                return {"error": f"Briefing API returned {response.status_code}"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _tool_get_calendar(self, time_range):
-        """Get calendar events directly from REST API (no Claude, no hallucination)."""
-        try:
-            response = requests.get(
-                f"http://100.71.119.36:3002/api/voice/calendar/events?range={time_range}",
-                headers={"X-API-Key": MONEO_API_KEY},
-                timeout=10
-            )
-            if response.status_code == 200:
-                data = response.json()
-                events = data.get("events", [])
-                if not events:
-                    return {"events": "none", "message": f"No events on calendar for {time_range}"}
-
-                event_list = []
-                for e in events:
-                    start = e.get("start", "")
-                    if "T" in start:
-                        from datetime import datetime as _dt
-                        t = _dt.fromisoformat(start.replace("Z", "+00:00"))
-                        time_str = t.strftime("%I:%M %p")
-                    else:
-                        time_str = start
-                    desc = e.get("description")
-                    entry = f"{time_str}: {e.get('summary', 'Untitled')}"
-                    if desc:
-                        entry += f" (Notes: {desc})"
-                    attendees = e.get("attendees")
-                    if attendees:
-                        entry += f" (Attendees: {attendees})"
-                    event_list.append(entry)
-
-                return {"events": event_list, "count": len(event_list)}
-            else:
-                return {"error": f"Calendar API returned {response.status_code}"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _tool_create_calendar_event(self, args):
-        """Create a Google Calendar event via Moneo API."""
-        try:
-            payload = {
-                "summary": args.get("summary", ""),
-                "startTime": args.get("start_time", ""),
-            }
-            if args.get("end_time"):
-                payload["endTime"] = args["end_time"]
-            if args.get("description"):
-                payload["description"] = args["description"]
-            if args.get("location"):
-                payload["location"] = args["location"]
-
-            response = requests.post(
-                "http://100.71.119.36:3002/api/voice/calendar/create",
-                headers={
-                    "X-API-Key": MONEO_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                json=payload,
-                timeout=10
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                logger.info(f"[Calendar] Event created: {args.get('summary')}")
-                return {"status": "created", "summary": args.get("summary"), "start_time": args.get("start_time")}
-            else:
-                return {"error": f"Calendar API returned {response.status_code}: {response.text[:200]}"}
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _tool_send_email(self, args):
-        """Send an email via Moneo API."""
-        try:
-            to = args.get("to", "")
-            subject = args.get("subject", "")
-            body = args.get("body", "")
-
-            if not to or not subject or not body:
-                return {"error": "Missing required fields: to, subject, body"}
-
-            response = requests.post(
-                "http://100.71.119.36:3002/api/voice/email/send",
-                headers={
-                    "X-API-Key": MONEO_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                json={"to": to, "subject": subject, "body": body},
-                timeout=10
-            )
-
-            if response.status_code == 200:
-                logger.info(f"[Email] Sent to {to}: {subject}")
-                return {"status": "sent", "to": to, "subject": subject}
-            else:
-                return {"error": f"Email API returned {response.status_code}: {response.text[:200]}"}
-
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _tool_run_command(self, command):
-        """Run a shell command on the Pi."""
-        # Block dangerous commands
-        blocked = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd", "shutdown", "reboot", "halt"]
-        for b in blocked:
-            if b in command:
-                return {"error": f"Blocked dangerous command containing '{b}'"}
-
-        try:
-            result = subprocess.run(
-                command, shell=True,
-                capture_output=True, text=True, timeout=15
-            )
-            output = result.stdout.strip()
-            error = result.stderr.strip()
-
-            # Truncate long output for voice
-            if len(output) > 500:
-                output = output[:500] + "... (truncated)"
-            if len(error) > 300:
-                error = error[:300] + "... (truncated)"
-
-            response = {"exit_code": result.returncode}
-            if output:
-                response["output"] = output
-            if error and result.returncode != 0:
-                response["error_output"] = error
-
-            logger.info(f"[Command] '{command}' -> exit {result.returncode}")
-            return response
-
-        except subprocess.TimeoutExpired:
-            return {"error": "Command timed out after 15 seconds"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _tool_debug_system(self, check):
-        """Run system diagnostics on the Oracle speaker."""
-        results = {}
-        try:
-            if check in ("services", "all"):
-                svc_check = subprocess.run(
-                    ["systemctl", "is-active", "oracle-master", "raspotify",
-                     "oracle-scheduler", "oracle-dashboard"],
-                    capture_output=True, text=True, timeout=5
-                )
-                services = dict(zip(
-                    ["oracle-master", "raspotify", "oracle-scheduler", "oracle-dashboard"],
-                    svc_check.stdout.strip().split("\n")
-                ))
-                results["services"] = services
-
-            if check in ("audio", "all"):
-                # Check sound cards
-                cards = subprocess.run(["cat", "/proc/asound/cards"],
-                    capture_output=True, text=True, timeout=3)
-                # Check loopback status
-                loopback = subprocess.run(
-                    ["cat", "/proc/asound/Loopback/pcm0p/sub0/status"],
-                    capture_output=True, text=True, timeout=3)
-                # Check volumes
-                vol = subprocess.run(["amixer", "-c", "4", "get", "Headphone"],
-                    capture_output=True, text=True, timeout=3)
-                results["audio"] = {
-                    "sound_cards": cards.stdout.strip(),
-                    "loopback_playback": loopback.stdout.strip().split("\n")[0] if loopback.stdout.strip() else "closed",
-                    "headphone_volume": vol.stdout.strip().split("\n")[-1].strip() if vol.stdout else "unknown"
-                }
-
-            if check in ("logs_master", "all"):
-                logs = subprocess.run(
-                    ["journalctl", "-u", "oracle-master", "--no-pager", "-n", "20", "--since", "5 min ago"],
-                    capture_output=True, text=True, timeout=5)
-                # Filter to important lines
-                important = [l for l in logs.stdout.split("\n")
-                    if any(k in l.lower() for k in ["error", "warn", "fail", "started", "stopped", "ready"])]
-                results["master_logs"] = important[-10:] if important else ["No errors in last 5 minutes"]
-
-            if check in ("logs_spotify", "all"):
-                logs = subprocess.run(
-                    ["journalctl", "-u", "raspotify", "--no-pager", "-n", "15"],
-                    capture_output=True, text=True, timeout=5)
-                important = [l for l in logs.stdout.split("\n")
-                    if any(k in l.lower() for k in ["error", "warn", "fail", "started", "stopped", "connect"])]
-                results["spotify_logs"] = important[-10:] if important else ["No issues found"]
-
-            if check in ("disk", "all"):
-                df = subprocess.run(["df", "-h", "/"],
-                    capture_output=True, text=True, timeout=3)
-                lines = df.stdout.strip().split("\n")
-                results["disk"] = lines[-1] if len(lines) > 1 else "unknown"
-
-            if check in ("network", "all"):
-                ts = subprocess.run(["tailscale", "status", "--json"],
-                    capture_output=True, text=True, timeout=5)
-                if ts.returncode == 0:
-                    import json as _json
-                    ts_data = _json.loads(ts.stdout)
-                    results["network"] = {
-                        "tailscale": "connected" if ts_data.get("BackendState") == "Running" else "disconnected",
-                        "hostname": ts_data.get("Self", {}).get("HostName", "unknown")
-                    }
-                else:
-                    results["network"] = {"tailscale": "error checking status"}
-
-            return results
-
-        except Exception as e:
-            return {"error": str(e), "partial_results": results}
-
-    def _tool_set_reminder(self, message, reminder_time, date="today", priority="medium"):
-        """Schedule a spoken reminder via the oracle scheduler."""
-        import json as _json
-        from datetime import datetime as _dt, timedelta
-
-        try:
-            # Parse the time
-            hour, minute = map(int, reminder_time.split(":"))
-
-            # Parse the date
-            now = _dt.now()
-            if not date or date.lower() == "today":
-                target_date = now.date()
-            elif date.lower() == "tomorrow":
-                target_date = (now + timedelta(days=1)).date()
-            else:
-                target_date = _dt.strptime(date, "%Y-%m-%d").date()
-
-            target_dt = _dt.combine(target_date, _dt.min.time().replace(hour=hour, minute=minute))
-
-            # Check if time is in the past
-            if target_dt < now:
-                return {"error": f"Cannot set reminder in the past ({target_dt.strftime('%I:%M %p')})"}
-
-            # Write reminder to a file that the scheduler can pick up
-            reminder = {
-                "message": message,
-                "time": target_dt.strftime("%Y-%m-%d %H:%M"),
-                "priority": priority,
-                "created": now.strftime("%Y-%m-%d %H:%M:%S")
-            }
-
-            # Append to reminders file
-            reminders_file = "/home/tyahn/oracle_reminders.json"
-            try:
-                with open(reminders_file, "r") as f:
-                    reminders = _json.load(f)
-            except (FileNotFoundError, _json.JSONDecodeError):
-                reminders = []
-
-            reminders.append(reminder)
-
-            with open(reminders_file, "w") as f:
-                _json.dump(reminders, f, indent=2)
-
-            # Also try to write directly to scheduler FIFO for immediate scheduling
-            fifo_path = "/tmp/oracle_remind.fifo"
-            try:
-                import os
-                if os.path.exists(fifo_path):
-                    fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-                    os.write(fd, (_json.dumps(reminder) + "\n").encode())
-                    os.close(fd)
-                    logger.info(f"[Reminder] Sent to scheduler FIFO: {reminder_time}")
-            except Exception:
-                pass  # FIFO not available, file-based reminder still saved
-
-            friendly_time = target_dt.strftime("%I:%M %p on %B %d")
-            logger.info(f"[Reminder] Set for {friendly_time}: {message}")
-
-            return {
-                "status": "set",
-                "delivery_time": friendly_time,
-                "message": message,
-                "priority": priority
-            }
-
-        except ValueError as e:
-            return {"error": f"Could not parse time/date: {e}"}
-        except Exception as e:
-            return {"error": str(e)}
+    # ==================== RUN ====================
 
     def run(self):
-        """Main service loop - runs threads"""
         logger.info('Starting Oracle Master Service...')
         self.running = True
-        
+
         try:
-            # Start background threads
-            briefing_thread = threading.Thread(target=self._briefing_scheduler_loop, daemon=True)
-            bridge_thread = threading.Thread(target=self.audio_bridge_loop, daemon=True)
-            spotify_thread = threading.Thread(target=self.monitor_spotify_loop, daemon=True)
-            wake_thread = threading.Thread(target=self.wake_word_detection_loop, daemon=True)
-            fifo_thread = threading.Thread(target=self.fifo_reader_loop, daemon=True)
+            threads = [
+                threading.Thread(target=self.briefing_loop, daemon=True),
+                threading.Thread(target=self.audio_bridge_loop, daemon=True),
+                threading.Thread(target=self.spotify.monitor_loop, args=(self,), daemon=True),
+                threading.Thread(target=self.wake_word_loop, daemon=True),
+                threading.Thread(target=self.fifo_reader_loop, daemon=True),
+            ]
+            for t in threads: t.start()
 
-            briefing_thread.start()
-            bridge_thread.start()
-            spotify_thread.start()
-            wake_thread.start()
-            fifo_thread.start()
-
-            logger.info('[Audio Bridge] Thread started')
-            logger.info('[Spotify Monitor] Thread started')
-            logger.info('[Wake Word] Thread started - listening for \'JARVIS\'')
-            logger.info('[FIFO Reader] Thread started')
             logger.info('✓ All threads started')
-            logger.info('✓ Wake word: \'JARVIS\' - works even during music')
-            logger.info('✓ Spotify monitoring active')
+            logger.info(f"✓ Wake word: '{WAKE_WORD[0].upper()}'")
             logger.info('✓ Oracle is ready!')
-            logger.info('============================================================')
-            
-            # Keep main thread alive
-            while True:
-                time.sleep(1)
-                
+            logger.info('=' * 60)
+
+            while True: time.sleep(1)
+
         except KeyboardInterrupt:
-            logger.info('Shutting down Oracle Master Service...')
+            logger.info('Shutting down...')
         finally:
             self.cleanup()
-    
+
     def cleanup(self):
-        """Clean up resources"""
-        if hasattr(self, 'porcupine'):
-            self.porcupine.delete()
-        if hasattr(self, 'mic_proc'):
-            self.mic_proc.terminate()
-        if hasattr(self, 'leds'):
-            self.leds.cleanup()
+        self.running = False
+        if hasattr(self, 'porcupine'): self.porcupine.delete()
+        if hasattr(self, 'mic_proc'): self.mic_proc.terminate()
+        if hasattr(self, 'leds'): self.leds.cleanup()
+        if hasattr(self, 'tuning_server'): self.tuning_server.stop()
         logger.info('✓ Shutdown complete')
 
-
-# ==================== MAIN ====================
 
 if __name__ == '__main__':
     oracle = OracleMasterService()

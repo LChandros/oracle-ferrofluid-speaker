@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oracle Ferrofluid Tuning</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #3fb950;
+    --danger: #f85149;
+    --orange: #d29922;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    padding: 16px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .subtitle { color: var(--text-dim); font-size: 0.85rem; margin-bottom: 16px; }
+  .status-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; background: var(--surface); border-radius: 6px;
+    margin-bottom: 16px; font-size: 0.85rem;
+  }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--danger);
+  }
+  .status-dot.connected { background: var(--accent2); }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 768px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 1rem;
+    margin-bottom: 12px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+  }
+  .param-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .param-row label {
+    flex: 0 0 140px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+  .param-row input[type="range"] {
+    flex: 1;
+    accent-color: var(--accent);
+    height: 6px;
+  }
+  .param-row .val {
+    flex: 0 0 60px;
+    text-align: right;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    color: var(--accent);
+  }
+  /* Live feedback panel */
+  .live-panel { grid-column: 1 / -1; }
+  .meters {
+    display: flex;
+    gap: 16px;
+    align-items: flex-end;
+    height: 120px;
+    margin-bottom: 12px;
+  }
+  .meter {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 100%;
+  }
+  .meter-bar-wrap {
+    width: 100%;
+    max-width: 60px;
+    height: 80px;
+    background: #21262d;
+    border-radius: 4px;
+    position: relative;
+    overflow: hidden;
+  }
+  .meter-bar {
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+    border-radius: 4px 4px 0 0;
+    transition: height 0.08s ease-out;
+  }
+  .meter-label {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+  .meter-value {
+    font-size: 0.8rem;
+    font-family: monospace;
+    color: var(--text);
+  }
+  .live-stats {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .stat {
+    text-align: center;
+  }
+  .stat-value {
+    font-size: 1.6rem;
+    font-family: monospace;
+    font-weight: bold;
+  }
+  .stat-label {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }
+  .beat-indicator {
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: #21262d;
+    border: 2px solid var(--border);
+    display: inline-block;
+    vertical-align: middle;
+    transition: background 0.05s;
+  }
+  .beat-indicator.active {
+    background: var(--danger);
+    box-shadow: 0 0 12px var(--danger);
+  }
+  /* Presets */
+  .preset-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .btn.danger { border-color: var(--danger); color: var(--danger); }
+  .btn.danger:hover { background: var(--danger); color: var(--bg); }
+  .btn.success { border-color: var(--accent2); color: var(--accent2); }
+  .btn.success:hover { background: var(--accent2); color: var(--bg); }
+  .save-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .save-row input {
+    flex: 1;
+    padding: 6px 10px;
+    background: #21262d;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.85rem;
+  }
+  .save-row input:focus { outline: none; border-color: var(--accent); }
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    padding: 10px 20px;
+    border-radius: 6px;
+    background: var(--accent2);
+    color: var(--bg);
+    font-size: 0.85rem;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all 0.3s;
+    pointer-events: none;
+    z-index: 999;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .tools-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .tools-grid .btn { padding: 10px 14px; text-align: center; }
+  .btn.on { background: var(--accent2); color: var(--bg); border-color: var(--accent2); }
+  .state-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .state-btns .btn { font-size: 0.75rem; padding: 4px 10px; }
+  .state-btns .btn.active { background: var(--accent); color: var(--bg); }
+  .color-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .color-row input[type="color"] {
+    width: 40px; height: 32px; border: 1px solid var(--border);
+    border-radius: 4px; background: var(--surface); cursor: pointer;
+  }
+  .duty-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .duty-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+  .duty-row .val { width: 45px; text-align: right; font-family: monospace; font-size: 0.85rem; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>Oracle Ferrofluid Tuning</h1>
+<p class="subtitle">Real-time parameter tuning for electromagnet + audio reactivity</p>
+
+<div class="status-bar">
+  <span class="status-dot" id="statusDot"></span>
+  <span id="statusText">Connecting...</span>
+</div>
+
+<div class="grid">
+
+  <!-- Electromagnet (MUSIC mode) -->
+  <div class="card">
+    <h2>Electromagnet (MUSIC)</h2>
+    <div class="param-row">
+      <label>Min Duty Cycle</label>
+      <input type="range" min="0" max="100" step="1" data-key="min_duty" value="35">
+      <span class="val">35%</span>
+    </div>
+    <div class="param-row">
+      <label>Max Duty Cycle</label>
+      <input type="range" min="0" max="100" step="1" data-key="max_duty" value="100">
+      <span class="val">100%</span>
+    </div>
+    <div class="param-row">
+      <label>PWM Frequency</label>
+      <input type="range" min="100" max="5000" step="50" data-key="pwm_frequency" value="1000">
+      <span class="val">1000 Hz</span>
+    </div>
+  </div>
+
+  <!-- State Ranges (LISTENING / THINKING / SPEAKING) -->
+  <div class="card">
+    <h2>State Ranges</h2>
+    <div class="param-row">
+      <label>Listening Min</label>
+      <input type="range" min="0" max="100" step="1" data-key="listening_min" value="40">
+      <span class="val">40%</span>
+    </div>
+    <div class="param-row">
+      <label>Listening Max</label>
+      <input type="range" min="0" max="100" step="1" data-key="listening_max" value="85">
+      <span class="val">85%</span>
+    </div>
+    <div class="param-row">
+      <label>Thinking Min</label>
+      <input type="range" min="0" max="100" step="1" data-key="thinking_min" value="70">
+      <span class="val">70%</span>
+    </div>
+    <div class="param-row">
+      <label>Thinking Max</label>
+      <input type="range" min="0" max="100" step="1" data-key="thinking_max" value="95">
+      <span class="val">95%</span>
+    </div>
+    <div class="param-row">
+      <label>Speaking Min</label>
+      <input type="range" min="0" max="100" step="1" data-key="speaking_min" value="80">
+      <span class="val">80%</span>
+    </div>
+    <div class="param-row">
+      <label>Speaking Max</label>
+      <input type="range" min="0" max="100" step="1" data-key="speaking_max" value="95">
+      <span class="val">95%</span>
+    </div>
+  </div>
+
+  <!-- Frequency Bands -->
+  <div class="card">
+    <h2>Frequency Bands</h2>
+    <div class="param-row">
+      <label>Sub-bass Low</label>
+      <input type="range" min="10" max="200" step="1" data-key="sub_bass_low" value="20">
+      <span class="val">20 Hz</span>
+    </div>
+    <div class="param-row">
+      <label>Sub-bass High</label>
+      <input type="range" min="20" max="300" step="1" data-key="sub_bass_high" value="80">
+      <span class="val">80 Hz</span>
+    </div>
+    <div class="param-row">
+      <label>Mid-bass Low</label>
+      <input type="range" min="40" max="400" step="1" data-key="mid_bass_low" value="80">
+      <span class="val">80 Hz</span>
+    </div>
+    <div class="param-row">
+      <label>Mid-bass High</label>
+      <input type="range" min="80" max="600" step="1" data-key="mid_bass_high" value="250">
+      <span class="val">250 Hz</span>
+    </div>
+    <div class="param-row">
+      <label>Sub-bass Weight</label>
+      <input type="range" min="0" max="200" step="1" data-key="sub_bass_weight" value="100">
+      <span class="val">100%</span>
+    </div>
+    <div class="param-row">
+      <label>Mid-bass Weight</label>
+      <input type="range" min="0" max="200" step="1" data-key="mid_bass_weight" value="100">
+      <span class="val">100%</span>
+    </div>
+  </div>
+
+  <!-- Dynamics -->
+  <div class="card">
+    <h2>Dynamics</h2>
+    <div class="param-row">
+      <label>Smoothing Normal</label>
+      <input type="range" min="0.01" max="0.50" step="0.01" data-key="smoothing_normal" value="0.15">
+      <span class="val">0.15</span>
+    </div>
+    <div class="param-row">
+      <label>Smoothing Beat</label>
+      <input type="range" min="0.01" max="0.30" step="0.01" data-key="smoothing_beat" value="0.05">
+      <span class="val">0.05</span>
+    </div>
+    <div class="param-row">
+      <label>Beat Threshold</label>
+      <input type="range" min="1.0" max="3.0" step="0.05" data-key="beat_threshold" value="1.4">
+      <span class="val">1.40</span>
+    </div>
+    <div class="param-row">
+      <label>Beat Boost</label>
+      <input type="range" min="1.0" max="3.0" step="0.05" data-key="beat_boost" value="1.3">
+      <span class="val">1.30</span>
+    </div>
+  </div>
+
+  <!-- Presets -->
+  <div class="card">
+    <h2>Presets</h2>
+    <div class="preset-grid" id="presetButtons">
+      <!-- Built-in presets populated by JS -->
+    </div>
+    <div class="save-row" style="margin-bottom:8px;">
+      <input type="text" id="presetName" placeholder="Custom preset name...">
+      <button class="btn success" onclick="saveCustomPreset()">Save</button>
+    </div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn danger" onclick="resetDefaults()">Reset to Defaults</button>
+    </div>
+  </div>
+
+  <!-- Hardware Tools -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Hardware Tools</h2>
+    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;">
+      
+      <div>
+        <h3 style="font-size:0.85rem; color:var(--text-dim); margin-bottom:8px;">Electromagnet</h3>
+        <div class="tools-grid">
+          <button class="btn" id="magnetToggle" onclick="toggleMagnet()">Magnet ON</button>
+          <button class="btn" onclick="magnetPulse('pulse')">5x Pulse</button>
+          <button class="btn" onclick="magnetPulse('ripple')">Ripple</button>
+          <button class="btn" onclick="magnetPulse('staccato')">Staccato</button>
+          <button class="btn" onclick="magnetPulse('breathe')">Breathe</button>
+        </div>
+        <div class="duty-row">
+          <label style="font-size:0.8rem; color:var(--text-dim);">Duty:</label>
+          <input type="range" min="0" max="100" value="100" id="magnetDuty" oninput="document.getElementById('magnetDutyVal').textContent=this.value+'%'">
+          <span class="val" id="magnetDutyVal">100%</span>
+        </div>
+      </div>
+
+      <div>
+        <h3 style="font-size:0.85rem; color:var(--text-dim); margin-bottom:8px;">LEDs</h3>
+        <div class="tools-grid">
+          <button class="btn" onclick="setLedColor()" id="ledOnBtn">LEDs ON</button>
+          <button class="btn" onclick="ledsOff()">LEDs OFF</button>
+        </div>
+        <div class="color-row">
+          <label style="font-size:0.8rem; color:var(--text-dim);">Color:</label>
+          <input type="color" id="ledColor" value="#0000ff">
+          <button class="btn" onclick="setLedColor()" style="padding:4px 10px; font-size:0.8rem;">Apply</button>
+        </div>
+      </div>
+
+      <div>
+        <h3 style="font-size:0.85rem; color:var(--text-dim); margin-bottom:8px;">System State</h3>
+        <div class="state-btns" id="stateButtons">
+          <button class="btn" onclick="setState('IDLE')">IDLE</button>
+          <button class="btn" onclick="setState('MUSIC')">MUSIC</button>
+          <button class="btn" onclick="setState('LISTENING')">LISTEN</button>
+          <button class="btn" onclick="setState('THINKING')">THINK</button>
+          <button class="btn" onclick="setState('SPEAKING')">SPEAK</button>
+        </div>
+        <div style="margin-top:8px; font-size:0.8rem; color:var(--text-dim);">
+          Current: <span id="currentState" style="color:var(--accent);">--</span>
+        </div>
+        <div style="margin-top:14px; padding-top:10px; border-top:1px solid #2a2a2a;">
+          <button class="btn" onclick="saveToDisk()" style="width:100%; font-weight:600;">Save to Disk</button>
+          <div id="saveStatus" style="margin-top:6px; font-size:0.75rem; color:var(--text-dim); min-height:14px;"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Live Feedback -->
+  <div class="card live-panel">
+    <h2>Live Audio Feedback</h2>
+    <div class="meters">
+      <div class="meter">
+        <div class="meter-bar-wrap">
+          <div class="meter-bar" id="bar_sub_bass" style="height:0%;background:var(--accent);"></div>
+        </div>
+        <span class="meter-label">Sub-bass</span>
+        <span class="meter-value" id="val_sub_bass">0%</span>
+      </div>
+      <div class="meter">
+        <div class="meter-bar-wrap">
+          <div class="meter-bar" id="bar_mid_bass" style="height:0%;background:var(--purple);"></div>
+        </div>
+        <span class="meter-label">Mid-bass</span>
+        <span class="meter-value" id="val_mid_bass">0%</span>
+      </div>
+      <div class="meter">
+        <div class="meter-bar-wrap">
+          <div class="meter-bar" id="bar_low_mid" style="height:0%;background:var(--orange);"></div>
+        </div>
+        <span class="meter-label">Low-mid</span>
+        <span class="meter-value" id="val_low_mid">0%</span>
+      </div>
+      <div class="meter">
+        <div class="meter-bar-wrap">
+          <div class="meter-bar" id="bar_pwm" style="height:0%;background:var(--accent2);"></div>
+        </div>
+        <span class="meter-label">PWM Duty</span>
+        <span class="meter-value" id="val_pwm">0%</span>
+      </div>
+    </div>
+    <div class="live-stats">
+      <div class="stat">
+        <div class="stat-value" id="bassPercent">0%</div>
+        <div class="stat-label">Bass Level</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="pwmPercent">0%</div>
+        <div class="stat-label">PWM Output</div>
+      </div>
+      <div class="stat">
+        <div>
+          <span class="beat-indicator" id="beatDot"></span>
+          <span class="stat-value" style="font-size:1rem;" id="beatText">--</span>
+        </div>
+        <div class="stat-label">Beat Detection</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// --- Globals ---
+let socket = null;
+let connected = false;
+let debounceTimers = {};
+let allPresets = {};
+const HAS_SOCKETIO = {{ 'true' if has_socketio else 'false' }};
+const DEFAULTS = {};
+
+// Weight params are sent as 0-2.0 but displayed as 0-200%
+const WEIGHT_KEYS = ['sub_bass_weight', 'mid_bass_weight'];
+const HZ_KEYS = ['sub_bass_low','sub_bass_high','mid_bass_low','mid_bass_high','pwm_frequency'];
+const PCT_KEYS = ['min_duty','max_duty','listening_min','listening_max','thinking_min','thinking_max','speaking_min','speaking_max'];
+
+function formatVal(key, raw) {
+  if (WEIGHT_KEYS.includes(key)) return Math.round(raw * 100) + '%';
+  if (HZ_KEYS.includes(key)) return raw + ' Hz';
+  if (PCT_KEYS.includes(key)) return raw + '%';
+  // Float params
+  let v = parseFloat(raw);
+  return isNaN(v) ? raw : v.toFixed(2);
+}
+
+function sliderToParam(key, sliderVal) {
+  if (WEIGHT_KEYS.includes(key)) return parseFloat(sliderVal) / 100.0;
+  return parseFloat(sliderVal);
+}
+
+function paramToSlider(key, paramVal) {
+  if (WEIGHT_KEYS.includes(key)) return Math.round(paramVal * 100);
+  return paramVal;
+}
+
+// --- Toast ---
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// --- Status ---
+function setStatus(isConnected, text) {
+  connected = isConnected;
+  document.getElementById('statusDot').className = 'status-dot' + (isConnected ? ' connected' : '');
+  document.getElementById('statusText').textContent = text || (isConnected ? 'Connected to master service' : 'Disconnected');
+}
+
+// --- Update sliders from params object ---
+function applyParams(params) {
+  if (!params || params.status === 'error') {
+    setStatus(false, 'Master service not responding: ' + (params?.error || 'unknown'));
+    return;
+  }
+  setStatus(true);
+  document.querySelectorAll('input[data-key]').forEach(slider => {
+    const key = slider.dataset.key;
+    if (key in params) {
+      const sv = paramToSlider(key, params[key]);
+      slider.value = sv;
+      slider.nextElementSibling.textContent = formatVal(key, params[key]);
+    }
+  });
+}
+
+// --- Collect current slider values as param dict ---
+function collectParams() {
+  const params = {};
+  document.querySelectorAll('input[data-key]').forEach(slider => {
+    params[slider.dataset.key] = sliderToParam(slider.dataset.key, slider.value);
+  });
+  return params;
+}
+
+// --- Send single param ---
+function sendParam(key, value) {
+  const paramValue = sliderToParam(key, value);
+  if (HAS_SOCKETIO && socket && socket.connected) {
+    socket.emit('set_param', {key: key, value: paramValue});
+  } else {
+    fetch('/api/param', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: key, value: paramValue})
+    });
+  }
+}
+
+// --- Slider event binding ---
+document.querySelectorAll('input[data-key]').forEach(slider => {
+  const key = slider.dataset.key;
+
+  slider.addEventListener('input', () => {
+    // Update display immediately
+    const raw = sliderToParam(key, slider.value);
+    slider.nextElementSibling.textContent = formatVal(key, raw);
+
+    // Debounce the actual send at ~50ms
+    if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
+    debounceTimers[key] = setTimeout(() => sendParam(key, slider.value), 50);
+  });
+});
+
+// --- Audio data handler ---
+function handleAudioData(data) {
+  if (!data || data.status === 'error') return;
+
+  const sub = (data.sub_bass || 0) * 100;
+  const mid = (data.mid_bass || 0) * 100;
+  const low = (data.low_mid || 0) * 100;
+  const pwm = data.pwm_duty || 0;
+  const bass = data.bass_pct || 0;
+  const beat = data.beat || false;
+
+  document.getElementById('bar_sub_bass').style.height = Math.min(sub, 100) + '%';
+  document.getElementById('bar_mid_bass').style.height = Math.min(mid, 100) + '%';
+  document.getElementById('bar_low_mid').style.height = Math.min(low, 100) + '%';
+  document.getElementById('bar_pwm').style.height = Math.min(pwm, 100) + '%';
+
+  document.getElementById('val_sub_bass').textContent = Math.round(sub) + '%';
+  document.getElementById('val_mid_bass').textContent = Math.round(mid) + '%';
+  document.getElementById('val_low_mid').textContent = Math.round(low) + '%';
+  document.getElementById('val_pwm').textContent = Math.round(pwm) + '%';
+
+  document.getElementById('bassPercent').textContent = Math.round(bass) + '%';
+  document.getElementById('pwmPercent').textContent = Math.round(pwm) + '%';
+
+  const beatDot = document.getElementById('beatDot');
+  const beatText = document.getElementById('beatText');
+  if (beat) {
+    beatDot.classList.add('active');
+    beatText.textContent = 'BEAT';
+    setTimeout(() => {
+      beatDot.classList.remove('active');
+      beatText.textContent = '--';
+    }, 150);
+  }
+}
+
+// --- Presets ---
+function loadPresets() {
+  fetch('/api/presets')
+    .then(r => r.json())
+    .then(presets => {
+      allPresets = presets;
+      renderPresetButtons();
+    });
+}
+
+function renderPresetButtons() {
+  const container = document.getElementById('presetButtons');
+  container.innerHTML = '';
+  for (const name in allPresets) {
+    const btn = document.createElement('button');
+    btn.className = 'btn';
+    btn.textContent = name;
+    btn.onclick = () => loadPreset(name);
+    container.appendChild(btn);
+  }
+}
+
+function loadPreset(name) {
+  const preset = allPresets[name];
+  if (!preset) return;
+  // Apply to sliders
+  applyParams(preset);
+  // Send bulk to master
+  fetch('/api/params/bulk', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({params: preset})
+  });
+  showToast('Loaded: ' + name);
+}
+
+function saveCustomPreset() {
+  const nameInput = document.getElementById('presetName');
+  const name = nameInput.value.trim();
+  if (!name) { showToast('Enter a preset name'); return; }
+  const params = collectParams();
+  fetch('/api/presets/save', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name, params: params})
+  }).then(() => {
+    showToast('Saved: ' + name);
+    nameInput.value = '';
+    loadPresets();
+  });
+}
+
+function resetDefaults() {
+  fetch('/api/defaults')
+    .then(r => r.json())
+    .then(defaults => {
+      applyParams(defaults);
+      fetch('/api/params/bulk', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({params: defaults})
+      });
+      showToast('Reset to defaults');
+    });
+}
+
+// --- Hardware tools ---
+let magnetOn = false;
+
+function toggleMagnet() {
+  const btn = document.getElementById('magnetToggle');
+  if (magnetOn) {
+    fetch('/api/magnet/off', {method:'POST'});
+    btn.textContent = 'Magnet ON';
+    btn.classList.remove('on');
+    magnetOn = false;
+  } else {
+    const duty = parseInt(document.getElementById('magnetDuty').value);
+    fetch('/api/magnet/on', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({duty:duty})});
+    btn.textContent = 'Magnet OFF';
+    btn.classList.add('on');
+    magnetOn = true;
+  }
+}
+
+function magnetPulse(pattern) {
+  fetch('/api/magnet/pulse', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pattern:pattern})});
+  showToast('Running: ' + pattern);
+}
+
+function setLedColor() {
+  const hex = document.getElementById('ledColor').value;
+  const r = parseInt(hex.substr(1,2), 16);
+  const g = parseInt(hex.substr(3,2), 16);
+  const b = parseInt(hex.substr(5,2), 16);
+  fetch('/api/leds/set', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({r:r, g:g, b:b})});
+}
+
+function ledsOff() {
+  fetch('/api/leds/off', {method:'POST'});
+}
+
+function setState(state) {
+  fetch('/api/state', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({state:state})});
+  document.getElementById('currentState').textContent = state;
+  showToast('State: ' + state);
+  // Highlight active button
+  document.querySelectorAll('#stateButtons .btn').forEach(b => {
+    b.classList.toggle('active', b.textContent.startsWith(state.substring(0,4)));
+  });
+}
+
+function pollState() {
+  fetch('/api/state').then(r=>r.json()).then(d => {
+    if (d.state) document.getElementById('currentState').textContent = d.state;
+  }).catch(()=>{});
+}
+setInterval(pollState, 2000);
+
+function saveToDisk() {
+  const status = document.getElementById('saveStatus');
+  status.textContent = 'Saving...';
+  status.style.color = 'var(--text-dim)';
+  fetch('/api/save', {method:'POST'}).then(r=>r.json()).then(d => {
+    if (d.status === 'ok') {
+      const n = (d.changes || []).reduce((s,c) => s + (c.count || 0), 0);
+      status.textContent = `Saved ${n} values. Backup: ${(d.backup||'').split('/').pop()}`;
+      status.style.color = 'var(--accent)';
+      showToast('Saved to disk');
+    } else {
+      status.textContent = 'Error: ' + (d.error || 'unknown');
+      status.style.color = '#ff6b6b';
+    }
+  }).catch(e => {
+    status.textContent = 'Error: ' + e.message;
+    status.style.color = '#ff6b6b';
+  });
+}
+
+// --- Init ---
+function init() {
+  // Load defaults
+  fetch('/api/defaults').then(r => r.json()).then(d => Object.assign(DEFAULTS, d));
+  loadPresets();
+
+  if (HAS_SOCKETIO) {
+    // SocketIO mode
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js';
+    script.onload = () => {
+      socket = io();
+      socket.on('connect', () => setStatus(true));
+      socket.on('disconnect', () => setStatus(false, 'Disconnected'));
+      socket.on('params', (data) => applyParams(data));
+      socket.on('audio_data', (data) => handleAudioData(data));
+      socket.on('param_ack', (data) => {
+        if (data.status === 'error') setStatus(false, 'Error: ' + data.error);
+      });
+    };
+    document.head.appendChild(script);
+  } else {
+    // SSE fallback
+    fetch('/api/params').then(r => r.json()).then(d => applyParams(d));
+    const es = new EventSource('/api/stream');
+    es.onmessage = (e) => {
+      try { handleAudioData(JSON.parse(e.data)); } catch(err) {}
+    };
+    es.onopen = () => setStatus(true, 'Connected (SSE mode)');
+    es.onerror = () => setStatus(false, 'Stream disconnected');
+    // Poll params every 5s in SSE mode
+    setInterval(() => {
+      fetch('/api/params').then(r => r.json()).then(d => applyParams(d));
+    }, 5000);
+  }
+}
+
+init();
+</script>
+</body>
+</html>
