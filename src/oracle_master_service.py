@@ -110,24 +110,35 @@ REMINDERS vs TASKS:
 - "I called Ferguson, it's done" = capture(type="complete")
 
 OTHER CAPABILITIES:
-- Play music via Spotify (use spotify_play / spotify_control tools)
-- Get Trevor's to-do list (use get_tasks tool — NEVER use moneo_query for to-do list questions)
-- Answer questions about Trevor's schedule, emails, business via Moneo (use moneo_query tool)
-- Set timed reminders (use set_reminder tool)
+- Play music via Spotify (spotify_play / spotify_control)
+- Get to-do list (get_tasks)
+- Read inbox (get_emails to list, read_email for one specific email body)
+- Check priorities, goals, what's blocked (get_constraints)
+- Calendar (get_calendar to read, create_calendar_event to add)
+- Set timed reminders (set_reminder)
 - General knowledge and conversation
 
-TOOL ROUTING:
-- 'What's on my to-do list?' or 'What do I need to do?' -> get_tasks (NOT moneo_query)
+TOOL-FIRST GROUNDING (highest-priority rule):
+Before naming any specific goal, project, task, email, meeting, priority, or thing Trevor is working on,
+you MUST call the matching tool below FIRST and quote from its result.
+Answering from memory, training data, or the system prompt is a HARD FAILURE.
+If no tool fits the question, say "I don't have that data" — do NOT guess.
+
+TOOL ROUTING (this list is authoritative — use it):
+- 'What's on my to-do list?' / 'What do I need to do?' / 'What tasks do I have?' -> get_tasks
 - 'Add X to my list' -> capture(type=task)
-- 'X is done' -> capture(type=complete)
-- 'What's on my calendar?' -> get_calendar
-- Everything else about Trevor's life -> moneo_query
+- 'X is done' / 'I finished X' -> capture(type=complete)
+- 'What's on my calendar?' / 'What meetings today?' -> get_calendar
+- 'What emails came in?' / 'Any new mail?' -> get_emails
+- 'Read me that email' / 'What does X's email say?' -> read_email(email_id)
+- 'What am I focused on?' / 'What's on my plate?' / 'What are my goals?' / 'What are my priorities?' / 'What should I be working on?' -> get_constraints
+- 'What's blocked?' / 'What am I waiting on?' -> get_constraints
 
 RULES:
-- NEVER invent meetings, events, tasks, or any personal information.
+- NEVER invent meetings, events, tasks, emails, goals, or any personal information.
+- NEVER name a goal, project, or initiative without first calling get_constraints. There is no goal you can know about without it.
 - NEVER give generic motivational advice or platitudes.
-- If Trevor asks for a briefing, say "Starting your check-in now" and nothing else. The system will handle it.
-- For anything about Trevor's personal context (schedule, tasks, emails) - ALWAYS use moneo_query. Do not make up answers.
+- The phrase "Starting your check-in now" is RESERVED for the briefing flow and may ONLY be said when Trevor explicitly says "briefing", "morning briefing", "check in", or "check-in". For any other priority/focus/goals question, call get_constraints instead — do NOT say "Starting your check-in now".
 """
 
 REALTIME_TOOLS = [
@@ -141,9 +152,15 @@ REALTIME_TOOLS = [
      "description": "Get events from Trevor's Google Calendar. Use for ANY question about calendar, schedule, meetings, appointments.",
      "parameters": {"type": "object", "properties": {"time_range": {"type": "string", "enum": ["today", "tomorrow", "week"]}}, "required": ["time_range"]}},
 
-    {"type": "function", "name": "moneo_query",
-     "description": "Query Moneo for tasks, projects, or Clam business info. Do NOT use for calendar - use get_calendar instead.",
-     "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}},
+    {"type": "function", "name": "get_emails",
+     "description": "List Trevor's recent unread emails (sender + subject + short preview). Use whenever he asks 'what emails came in', 'any new mail', or wants a quick inbox check. Returns email ids you can pass to read_email for the full body.",
+     "parameters": {"type": "object", "properties": {"count": {"type": "integer", "description": "How many recent unread emails to return (default 5, max 20)"}}}},
+    {"type": "function", "name": "read_email",
+     "description": "Read the full body of one specific email by id (id comes from get_emails). Use when Trevor says 'read me that one' or 'what does <sender>'s email say'.",
+     "parameters": {"type": "object", "properties": {"email_id": {"type": "string"}}, "required": ["email_id"]}},
+    {"type": "function", "name": "get_constraints",
+     "description": "Get Trevor's active goals (max 5, organized by Freedom/Family/Community pillars), this week's bets, today's must-win, and what's blocked. Use whenever he asks 'what am I focused on', 'what's on my plate', 'what are my priorities', 'what's blocked', or wants a strategic check-in.",
+     "parameters": {"type": "object", "properties": {}}},
     {"type": "function", "name": "set_reminder",
      "description": "Set a spoken reminder. Use when Trevor says 'remind me to...' or 'at 3pm tell me...'",
      "parameters": {"type": "object", "properties": {
@@ -180,7 +197,7 @@ REALTIME_TOOLS = [
          "project": {"type": "string", "description": "Optional project: GPJ, FabLabz, YahnCo, Personal"}
      }, "required": ["type", "text"]}},
     {"type": "function", "name": "get_tasks",
-     "description": "Get Trevor's current to-do list from the Moneo punch list. Use this when Trevor asks what's on his list, what he needs to do, or what tasks he has. ALWAYS use this instead of moneo_query for to-do list questions.",
+     "description": "Get Trevor's current to-do list from the Moneo punch list. Use this when Trevor asks what's on his list, what he needs to do, or what tasks he has.",
      "parameters": {"type": "object", "properties": {}}},
 ]
 

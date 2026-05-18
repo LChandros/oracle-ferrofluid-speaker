@@ -18,13 +18,15 @@ const logger = require('../utils/logger');
 const OracleConversationStore = require('./oracle-conversation-store');
 
 class VoiceIntegration {
-  constructor(config, tasksManager, calendarManager, projectManager, notesManager, emailManager) {
+  constructor(config, tasksManager, calendarManager, projectManager, notesManager, emailManager, systemStateManager, emailReader) {
     this.config = config;
     this.tasksManager = tasksManager;
     this.calendarManager = calendarManager;
     this.projectManager = projectManager;
     this.notesManager = notesManager;
     this.emailManager = emailManager;
+    this.emailReader = emailReader || emailManager; // For inbox reads (Trevor's), falls back to default
+    this.systemStateManager = systemStateManager;
     this.morningBriefing = null; // Set by moneo-core after initialization
     this.meetingScheduler = null; // Set by moneo-core after initialization
 
@@ -681,6 +683,65 @@ Only include items that were explicitly stated. Do not infer or add items that w
         res.json({ turns, formatted, count: turns.length });
       } catch (error) {
         logger.error('[Oracle] context error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ===== Phase 2: typed REST tools (replaces moneo_query hallucinator) =====
+
+    this.app.get('/api/voice/emails', async (req, res) => {
+      try {
+        if (!this.emailReader) {
+          return res.status(503).json({ error: 'Email reader not available' });
+        }
+        const count = parseInt(req.query.count || '5', 10);
+        const unreadOnly = req.query.unread_only !== 'false';
+        const emails = await this.emailReader.getRecentEmails(count, unreadOnly);
+        const summary = emails.map(e => ({
+          id: e.id,
+          from: e.from,
+          subject: e.subject,
+          snippet: e.snippet,
+          date: e.date,
+          unread: e.isUnread,
+          hasAttachments: e.hasAttachments,
+        }));
+        res.json({ emails: summary, count: summary.length });
+      } catch (error) {
+        logger.error('[Voice] emails list error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    this.app.get('/api/voice/emails/:id', async (req, res) => {
+      try {
+        if (!this.emailReader) {
+          return res.status(503).json({ error: 'Email reader not available' });
+        }
+        const detail = await this.emailReader.getEmailDetails(req.params.id);
+        res.json(detail);
+      } catch (error) {
+        logger.error('[Voice] email body error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    this.app.get('/api/voice/constraints', (req, res) => {
+      try {
+        if (!this.systemStateManager) {
+          return res.status(503).json({ error: 'System state manager not available' });
+        }
+        const ssm = this.systemStateManager;
+        const today = new Date().toISOString().slice(0, 10);
+        res.json({
+          goals: ssm.getGoals(),
+          weeklyBets: ssm.getWeeklyBets ? ssm.getWeeklyBets() : [],
+          todaysMustWin: ssm.getMustWin ? ssm.getMustWin(today) : null,
+          blocked: ssm.getBlocked ? ssm.getBlocked() : [],
+          stats: ssm.getStats ? ssm.getStats(7) : null,
+        });
+      } catch (error) {
+        logger.error('[Voice] constraints error:', error);
         res.status(500).json({ error: error.message });
       }
     });
