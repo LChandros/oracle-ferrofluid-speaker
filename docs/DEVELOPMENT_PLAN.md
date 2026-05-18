@@ -1,7 +1,7 @@
 # Oracle Ferrofluid Speaker — Development Plan to "Jarvis" Scope
 
 **Created:** 2026-05-18
-**Status:** Phase 0 ✓ (b6513d2). Phase 1 ✓ (da96965). Phase 2 ✓ (2cd1940). Phase 3 ✓ (84ffe77, verified 2026-05-18). Phase 4 next.
+**Status:** Phase 0 ✓ (b6513d2). Phase 1 ✓ (da96965). Phase 2 ✓ (2cd1940). Phase 3 ✓ (84ffe77). Phase 4 PARTIAL (a21b51a — infra wired, prompt deferred pending project-tracking redesign). Phase 5 next.
 
 ## Scope (per Trevor, 2026-05-18)
 
@@ -51,13 +51,19 @@ Single biggest thing separating "voice toy" from "Jarvis."
 - Ferrofluid pulses purple while alerts unacknowledged; clears on next interaction
 - **Done when:** Clam PO arrives → Oracle speaks within 30s.
 
-### Phase 4 — EOD interview + audio notes (~6 hrs)
-Two scope bullets, shared infrastructure.
-- 6 PM weekday auto-trigger (reuses scheduler)
-- Structured prompt scaffold: "What shipped? What's blocked? Tomorrow's #1?"
-- Transcript saved to Moneo, summarized into `/vault/daily-debriefs/YYYY-MM-DD.md`
-- New `capture_note` tool: "Computer, take a note" → records → Whisper transcribes → saves to droplet
-- **Done when:** 6 PM auto-fires interview, ad-hoc audio notes land in vault.
+### Phase 4 — EOD interview + audio notes (~6 hrs) — PARTIAL 2026-05-18 (commit a21b51a)
+INFRASTRUCTURE COMPLETE (scheduler hook, _deliver_eod_checkin, extract endpoint
+with kind='eod', vault writeout to /home/moneo/vault/moneo/daily-debriefs/,
+manual trigger endpoint). 6 PM auto-fire DISABLED pending prompt redesign.
+
+**What's deferred:** the 3-question prompt itself is too generic. Live test
+confirmed open questions like "what shipped today?" don't extract well. v2
+needs to pre-fetch today's must-win + open tasks + active goals so questions
+are anchored ("did you hit your must-win X?" vs "what shipped?"). Blocked
+on project-tracking architecture being redesigned separately.
+
+Audio notes (capture(type=note)) already work for short utterances via the
+existing capture tool — no additional work needed for that bullet.
 
 ### Phase 5 — Spotify search/play + email reading (~4 hrs)
 - Wire `spotify_play(query)` to existing `core/modules/spotify-manager.js`
