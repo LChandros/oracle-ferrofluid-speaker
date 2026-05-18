@@ -1,7 +1,7 @@
 # Oracle Ferrofluid Speaker — Development Plan to "Jarvis" Scope
 
 **Created:** 2026-05-18
-**Status:** Phase 0 ✓ (b6513d2). Phase 1 ✓ (da96965). Phase 2 ✓ (2cd1940, verified 2026-05-18). Phase 3 next.
+**Status:** Phase 0 ✓ (b6513d2). Phase 1 ✓ (da96965). Phase 2 ✓ (2cd1940). Phase 3 ✓ (84ffe77, verified 2026-05-18). Phase 4 next.
 
 ## Scope (per Trevor, 2026-05-18)
 
@@ -38,7 +38,12 @@ The "Pi thin, Moneo brain" refactor from April.
 - Same pattern as `get_calendar` (already works correctly)
 - **Done when:** "What's on my plate?" returns real data, not creative writing.
 
-### Phase 3 — Proactive alerts (~6 hrs)
+### Phase 3 — Proactive alerts (~6 hrs) — COMPLETE 2026-05-18 (commit 84ffe77)
+Two-tier delivery: critical speaks immediately, info goes to a pending store
+and pulses the LEDs softly every 10 min until acknowledged. Voice-cleared
+via list_pending_notifications + clear_notifications tools. Midnight cron
+auto-sweeps anything still pending. Sources wired: calendar countdowns
+(T-15 info, T-5 critical) and Clam PO drafts (critical).
 Single biggest thing separating "voice toy" from "Jarvis."
 - Pi opens persistent WebSocket to droplet `/api/oracle/events`
 - Droplet fans in: ntfy alerts, new Clam PO, urgent Gmail label, print-farm failures
