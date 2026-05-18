@@ -867,19 +867,36 @@ If he doesn't say anything, the session will time out and that's fine.
     # ==================== BRIEFING SCHEDULER ====================
 
     def briefing_loop(self):
-        """Background thread: Deliver morning briefing at 10 AM ET weekdays."""
+        """Background thread: Deliver morning briefing at 10 AM and EOD check-in at 6 PM ET weekdays."""
         delivered_today = False
-        logger.info("[Briefing] Scheduler started - delivery at 10:00 AM ET")
+        eod_delivered_today = False
+        logger.info("[Briefing] Scheduler started - morning 10:00 AM ET (weekdays); EOD auto-fire DISABLED, manual trigger only")
 
         while self.running:
             try:
                 now = datetime.now()
                 if now.hour == 0 and now.minute == 0:
                     delivered_today = False
+                    eod_delivered_today = False
                 if now.hour == 10 and now.minute == 0 and now.weekday() < 5 and not delivered_today:
                     logger.info("[Briefing] 10:00 AM ET - delivering morning briefing")
                     delivered_today = True
                     self._deliver_briefing()
+                # EOD auto-fire is DISABLED pending project-tracking redesign (2026-05-18).
+                # The current 3-question prompt is too generic; will be reworked to anchor
+                # against today's must-win + open tasks + active goals once the new tracking
+                # model is settled. Manual trigger below still works for development.
+                # if now.hour == 18 and now.minute == 0 and now.weekday() < 5 and not eod_delivered_today:
+                #     logger.info("[Briefing] 6:00 PM ET - delivering EOD check-in")
+                #     eod_delivered_today = True
+                #     self._deliver_eod_checkin()
+                _ = eod_delivered_today  # keep variable referenced
+                # External trigger via /tmp/oracle_eod_trigger (touched by manual test endpoint)
+                if os.path.exists('/tmp/oracle_eod_trigger'):
+                    try: os.remove('/tmp/oracle_eod_trigger')
+                    except: pass
+                    logger.info("[Briefing] Manual EOD trigger detected")
+                    self._deliver_eod_checkin()
                 time.sleep(30)
             except Exception as e:
                 logger.error(f"[Briefing] Error: {e}")
@@ -995,6 +1012,94 @@ CONVERSATION RULES:
             logger.info("[Briefing] Delivery complete")
         except Exception as e:
             logger.error(f"[Briefing] Error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.realtime_session_active = False
+
+    def _deliver_eod_checkin(self):
+        """Deliver the EOD check-in interview at 6 PM weekday. Slimmer than the morning
+        briefing — no pre-generated script, just opens a 3-question Realtime Q&A and
+        ships the transcript to /api/voice/checkin/extract with kind='eod' so the
+        droplet writes a daily debrief to vault/moneo/daily-debriefs/."""
+        logger.info("[EOD] Starting check-in...")
+        try:
+            self._spotify_was_playing = self.spotify.playing
+            if self._spotify_was_playing: self.spotify.pause()
+            play_chime(ascending=True)
+            time.sleep(0.5)
+
+            eod_prompt = """You are Oracle, Trevor Yahn's AI assistant, delivering his end-of-day check-in over the speaker.
+
+Ask these three questions ONE AT A TIME, waiting for his response before moving on. Acknowledge briefly between them (one phrase like "Got it." or "Logged."). Do not ask follow-up questions unless he gives a one-word answer.
+
+1. What shipped today?
+2. What's blocked or stuck?
+3. What's tomorrow's number one?
+
+CAPTURE RULES (run these in parallel with the questions — your main job here):
+- Anything Trevor says is DONE/FINISHED/SHIPPED -> capture(type="complete")
+- Any blocker he names -> capture(type="note")
+- Tomorrow's #1 -> capture(type="commitment")
+- Any other actionable item that surfaces -> capture(type="task")
+Call capture without asking permission. Do NOT use dismiss_reminder for task completions.
+
+CONVERSATION RULES:
+- Keep responses to 1-2 sentences. Speaking out loud, not writing.
+- No motivational platitudes or summaries.
+- Be direct, JARVIS-style.
+- Start by saying "End of day check-in. What shipped today?"
+- After question 3, say "Logged. EOD complete. Talk in the morning." and end."""
+
+            self.realtime_session_active = True
+            self.leds.set_state("SPEAKING")
+
+            session = OracleRealtimeSession(
+                api_key=OPENAI_API_KEY, system_prompt=eod_prompt,
+                tools=REALTIME_TOOLS, tool_handler=self.tools.handle,
+                on_speech_started=lambda: self.leds.set_state("LISTENING"),
+                on_speech_ended=lambda: self.leds.set_state("THINKING"),
+                on_audio_started=lambda: self.leds.set_state("SPEAKING"),
+                on_response_done=lambda: None,
+                on_error=lambda msg: logger.error(f"[EOD] Error: {msg}"),
+                on_mic_mute=self._mute_mic, on_mic_unmute=self._unmute_mic,
+                auto_start=True, session_timeout=45,
+                memory_url=self._memory_base_url(),
+                memory_api_key=MONEO_API_KEY,
+                session_id=self.session_id,
+            )
+            self.current_session = session
+            session.start()
+            while session.active and self.running: time.sleep(0.1)
+            self.current_session = None
+            self.realtime_session_active = False
+
+            if session.transcript:
+                logger.info(f"[EOD] Extracting captures from {len(session.transcript)} transcript entries")
+                try:
+                    api_base = MONEO_API_URL.rsplit('/api/', 1)[0]
+                    extract_resp = requests.post(
+                        f"{api_base}/api/voice/checkin/extract",
+                        headers={"X-API-Key": MONEO_API_KEY, "Content-Type": "application/json"},
+                        json={"transcript": session.transcript, "kind": "eod"},
+                        timeout=30
+                    )
+                    if extract_resp.status_code == 200:
+                        result = extract_resp.json()
+                        logger.info(f"[EOD] Captured {result.get('captured', 0)} items from check-in")
+                    else:
+                        logger.error(f"[EOD] Extract failed: {extract_resp.status_code}")
+                except Exception as e:
+                    logger.error(f"[EOD] Extract error: {e}")
+
+            time.sleep(1)
+            play_chime(ascending=False)
+            if self._spotify_was_playing:
+                self.spotify.resume(); self.leds.set_state("MUSIC")
+            else:
+                self.leds.set_state("IDLE")
+            logger.info("[EOD] Delivery complete")
+        except Exception as e:
+            logger.error(f"[EOD] Error: {e}")
             import traceback
             logger.error(traceback.format_exc())
             self.realtime_session_active = False

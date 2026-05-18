@@ -557,10 +557,11 @@ class VoiceIntegration {
     // Check-in transcript extraction — extracts commitments, tasks, and notes from Q&A
     this.app.post('/api/voice/checkin/extract', async (req, res) => {
       try {
-        const { transcript } = req.body;
+        const { transcript, kind = 'briefing' } = req.body;
         if (!transcript || !Array.isArray(transcript) || transcript.length === 0) {
           return res.status(400).json({ error: 'No transcript provided' });
         }
+        const isEod = kind === 'eod';
 
         const Anthropic = require('@anthropic-ai/sdk');
         const anthropic = new Anthropic({ apiKey: this.config.anthropicApiKey || process.env.ANTHROPIC_API_KEY });
@@ -573,17 +574,26 @@ class VoiceIntegration {
           return `${role}: ${entry.text}`;
         }).join('\n');
 
-        const response = await anthropic.messages.create({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 500,
-          system: `Extract actionable items from this morning check-in conversation between Trevor and Oracle. Return ONLY valid JSON with this structure:
+        const systemPromptEod = `Extract items from this end-of-day check-in between Trevor and Oracle. Return ONLY valid JSON with this structure:
+{
+  "commitments": ["things Trevor said are his TOMORROW priorities or commitments"],
+  "tasks": ["new specific tasks that surfaced for tracking"],
+  "decisions": ["things Trevor said SHIPPED, FINISHED, or were COMPLETED today"],
+  "notes": ["blockers, stuck items, or important context"]
+}
+Only include items that were explicitly stated. Do not infer. Empty arrays for empty categories.`;
+        const systemPromptBriefing = `Extract actionable items from this morning check-in conversation between Trevor and Oracle. Return ONLY valid JSON with this structure:
 {
   "commitments": ["things Trevor said he would do today"],
   "tasks": ["specific tasks mentioned that need tracking"],
   "decisions": ["decisions Trevor made during the check-in"],
   "notes": ["other important context or updates"]
 }
-Only include items that were explicitly stated. Do not infer or add items that weren't discussed. If a category has no items, use an empty array.`,
+Only include items that were explicitly stated. Do not infer or add items that weren't discussed. If a category has no items, use an empty array.`;
+        const response = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 500,
+          system: isEod ? systemPromptEod : systemPromptBriefing,
           messages: [{ role: 'user', content: formatted }]
         });
 
@@ -599,34 +609,40 @@ Only include items that were explicitly stated. Do not infer or add items that w
         const totalCaptured = extracted.commitments.length + extracted.tasks.length +
           extracted.decisions.length + extracted.notes.length;
 
-        // Append to today's briefing transcript in vault
+        // Append to today's check-in transcript in vault
         if (totalCaptured > 0) {
           const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-          const vaultPath = `/home/moneo/vault/moneo/briefings/${dateStr}.md`;
+          const vaultDir = isEod
+            ? '/home/moneo/vault/moneo/daily-debriefs'
+            : '/home/moneo/vault/moneo/briefings';
+          const vaultPath = `${vaultDir}/${dateStr}.md`;
+          const headerLabel = isEod ? 'Daily Debrief' : 'Check-in';
+          const sectionHeader = isEod ? '\n## EOD Captures\n\n' : '\n## Check-in Captures\n\n';
           try {
+            await fs.mkdir(vaultDir, { recursive: true });
             let existing = '';
             try { existing = await fs.readFile(vaultPath, 'utf8'); } catch {}
 
-            let appendText = '\n## Check-in Captures\n\n';
+            let appendText = sectionHeader;
             if (extracted.commitments.length > 0) {
-              appendText += '**Commitments:**\n' + extracted.commitments.map(c => `- ${c}`).join('\n') + '\n\n';
+              appendText += `**${isEod ? 'Tomorrow\'s commitments' : 'Commitments'}:**\n` + extracted.commitments.map(c => `- ${c}`).join('\n') + '\n\n';
             }
             if (extracted.tasks.length > 0) {
               appendText += '**Tasks:**\n' + extracted.tasks.map(t => `- [ ] ${t}`).join('\n') + '\n\n';
             }
             if (extracted.decisions.length > 0) {
-              appendText += '**Decisions:**\n' + extracted.decisions.map(d => `- ${d}`).join('\n') + '\n\n';
+              appendText += `**${isEod ? 'Shipped / Decisions' : 'Decisions'}:**\n` + extracted.decisions.map(d => `- ${d}`).join('\n') + '\n\n';
             }
             if (extracted.notes.length > 0) {
-              appendText += '**Notes:**\n' + extracted.notes.map(n => `- ${n}`).join('\n') + '\n\n';
+              appendText += `**${isEod ? 'Blockers / Notes' : 'Notes'}:**\n` + extracted.notes.map(n => `- ${n}`).join('\n') + '\n\n';
             }
 
             if (existing) {
               await fs.writeFile(vaultPath, existing + appendText);
             } else {
-              await fs.writeFile(vaultPath, `# Check-in — ${dateStr}\n\n` + appendText);
+              await fs.writeFile(vaultPath, `# ${headerLabel} — ${dateStr}\n\n` + appendText);
             }
-            logger.info(`[Voice] Saved ${totalCaptured} captures to vault: ${vaultPath}`);
+            logger.info(`[Voice] Saved ${totalCaptured} ${kind} captures to vault: ${vaultPath}`);
           } catch (e) {
             logger.warn(`[Voice] Failed to write captures to vault: ${e.message}`);
           }
@@ -756,6 +772,28 @@ Only include items that were explicitly stated. Do not infer or add items that w
       } catch (error) {
         logger.error('[Oracle] pending clear error:', error);
         res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ===== Phase 4: manual EOD trigger (for testing — production fires at 6 PM weekday) =====
+
+    this.app.post('/api/voice/eod/trigger', async (req, res) => {
+      try {
+        // Pi-side: briefing_loop polls for /tmp/oracle_eod_trigger every 30s.
+        // SSH from droplet → touch the marker file. Pi clears it on detection.
+        const { exec } = require('child_process');
+        exec("sshpass -p 'admin' ssh -o StrictHostKeyChecking=no tyahn@100.82.131.122 'touch /tmp/oracle_eod_trigger' 2>&1",
+          { timeout: 10000 },
+          (err, stdout, stderr) => {
+            if (err) {
+              logger.error('[EOD trigger] ssh failed:', err.message);
+              return res.status(500).json({ error: err.message });
+            }
+            logger.info('[EOD trigger] marker touched on Pi');
+            res.json({ status: 'triggered', note: 'Pi will pick up within 30s' });
+          });
+      } catch (e) {
+        res.status(500).json({ error: e.message });
       }
     });
 
