@@ -16,6 +16,7 @@ const bodyParser = require('body-parser');
 const Anthropic = require('@anthropic-ai/sdk');
 const logger = require('../utils/logger');
 const OracleConversationStore = require('./oracle-conversation-store');
+const { getStore: getPendingStore } = require('./oracle-pending-store');
 
 class VoiceIntegration {
   constructor(config, tasksManager, calendarManager, projectManager, notesManager, emailManager, systemStateManager, emailReader) {
@@ -722,6 +723,38 @@ Only include items that were explicitly stated. Do not infer or add items that w
         res.json(detail);
       } catch (error) {
         logger.error('[Voice] email body error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ===== Phase 3: pending notifications =====
+
+    this.app.get('/api/oracle/pending', (req, res) => {
+      try {
+        const pending = getPendingStore().getPending();
+        res.json({ pending, count: pending.length });
+      } catch (error) {
+        logger.error('[Oracle] pending get error:', error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    this.app.post('/api/oracle/pending/clear', (req, res) => {
+      try {
+        const store = getPendingStore();
+        const { alert_id, id, stale_only, older_than_hours } = req.body || {};
+        let cleared = 0;
+        if (alert_id) cleared = store.clearByAlertId(alert_id);
+        else if (id) cleared = store.clearById(parseInt(id, 10));
+        else if (stale_only) {
+          const ms = (parseFloat(older_than_hours || 12) * 3600 * 1000);
+          cleared = store.clearStale(ms);
+        } else {
+          cleared = store.clearAll();
+        }
+        res.json({ status: 'ok', cleared });
+      } catch (error) {
+        logger.error('[Oracle] pending clear error:', error);
         res.status(500).json({ error: error.message });
       }
     });

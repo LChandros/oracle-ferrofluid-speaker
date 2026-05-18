@@ -36,10 +36,10 @@ CHUNK_SIZE = 1024
 # Electromagnet pattern parameters
 MAGNET_PARAMS = {
     'IDLE': {'min_duty': 0, 'max_duty': 0},           # Completely off
-    'LISTENING': {'min_duty': 20, 'max_duty': 50},    # Gentle pulse
-    'THINKING': {'min_duty': 15, 'max_duty': 70},     # Chaotic movement (increased range)
-    'SPEAKING': {'min_duty': 30, 'max_duty': 85},     # Strong rhythmic (increased)
-    'MUSIC': {'min_duty': 35, 'max_duty': 100}        # Audio-reactive (35% baseline hold)
+    'LISTENING': {'min_duty': 40, 'max_duty': 85},    # Gentle pulse
+    'THINKING': {'min_duty': 70, 'max_duty': 95},     # Chaotic movement (increased range)
+    'SPEAKING': {'min_duty': 80, 'max_duty': 95},     # Strong rhythmic (increased)
+    'MUSIC': {'min_duty': 50, 'max_duty': 100}        # Audio-reactive (35% baseline hold)
 }
 
 # Audio analysis parameters (research-optimized)
@@ -55,8 +55,12 @@ BEAT_THRESHOLD_MULTIPLIER = 1.4  # 40% above average = beat
 BEAT_BOOST_FACTOR = 1.3          # Boost PWM by 30% on beats
 
 # Smoothing parameters
-SMOOTHING_NORMAL = 0.15    # Reduced from 0.3 for faster response
-SMOOTHING_BEAT = 0.05      # Minimal smoothing during beats
+SMOOTHING_NORMAL = 0.05    # Reduced from 0.3 for faster response
+SMOOTHING_BEAT = 0.0      # Minimal smoothing during beats
+
+# Band weight multipliers (tunable via dashboard, 1.0 = 100%)
+SUB_BASS_WEIGHT = 1.5
+MID_BASS_WEIGHT = 1.0
 
 class OracleLEDController:
     """Controls LED states for Oracle voice assistant and music visualization"""
@@ -108,6 +112,34 @@ class OracleLEDController:
     def set_tts_audio_level(self, level):
         """Update TTS audio level (0.0-1.0) for SPEAKING mode"""
         self.tts_audio_level = max(0.0, min(1.0, level))
+
+    def flash_alert(self, peak_color=(120, 0, 0), cycles=3, period_ms=1400, steps=28):
+        """Soft pulsing alert (for info-severity alerts).
+        Smoothly fades the strip from off → peak_color → off via a sine envelope,
+        then restores the prior state. Default = three slow red breaths."""
+        import math, time
+        prev_state = self.current_state
+        # Stop any current animation so it doesn't fight us
+        self.running = False
+        if self.animation_thread and self.animation_thread.is_alive():
+            self.animation_thread.join(timeout=0.5)
+        pr, pg, pb = peak_color
+        step_dt = max((period_ms / 1000.0) / steps, 0.01)
+        for _ in range(cycles):
+            for s in range(steps):
+                # sine envelope: 0 → 1 → 0 over `steps` samples
+                env = math.sin(math.pi * s / max(steps - 1, 1))
+                r = int(pr * env); g = int(pg * env); b = int(pb * env)
+                for i in range(LED_COUNT):
+                    self.strip.setPixelColor(i, Color(r, g, b))
+                self.strip.show()
+                time.sleep(step_dt)
+        # Ensure full-off before handing back
+        for i in range(LED_COUNT):
+            self.strip.setPixelColor(i, Color(0, 0, 0))
+        self.strip.show()
+        # Restore prior state animation
+        self.set_state(prev_state or 'IDLE')
 
     def _start_animation(self, animation_func):
         """Start animation in background thread"""
@@ -300,12 +332,16 @@ class OracleLEDController:
                     freqs = np.fft.rfftfreq(len(mono), 1/SAMPLE_RATE)
                     magnitudes = np.abs(fft)
 
-                    # Extract OPTIMIZED frequency bands
-                    sub_bass_mask = (freqs >= 20) & (freqs < 80)
-                    mid_bass_mask = (freqs >= 80) & (freqs < 250)
+                    # Extract frequency bands (tunable via dashboard)
+                    sub_bass_mask = (freqs >= FREQUENCY_RANGES['sub_bass'][0]) & (freqs < FREQUENCY_RANGES['sub_bass'][1])
+                    mid_bass_mask = (freqs >= FREQUENCY_RANGES['mid_bass'][0]) & (freqs < FREQUENCY_RANGES['mid_bass'][1])
 
                     sub_bass = np.mean(magnitudes[sub_bass_mask]) if np.any(sub_bass_mask) else 0
                     mid_bass = np.mean(magnitudes[mid_bass_mask]) if np.any(mid_bass_mask) else 0
+
+                    # Apply tunable band weights
+                    sub_bass = sub_bass * SUB_BASS_WEIGHT
+                    mid_bass = mid_bass * MID_BASS_WEIGHT
 
                     # Combine: Sub-bass is primary (70%), mid-bass is accent (30%)
                     combined_bass = (sub_bass * 0.7 + mid_bass * 0.3)
@@ -357,6 +393,14 @@ class OracleLEDController:
                     # Apply smoothing
                     magnet_smoothed = smoothing * magnet_smoothed + (1 - smoothing) * target_duty
                     self.magnet_pwm.ChangeDutyCycle(magnet_smoothed)
+
+                    # Expose live data for tuning dashboard
+                    self._last_sub_bass = sub_bass
+                    self._last_mid_bass = mid_bass
+                    self._last_low_mid = mid_level if 'mid_level' in dir() else 0
+                    self._last_pwm_duty = magnet_smoothed
+                    self._last_bass_pct = bass_level
+                    self._last_beat = is_beat
 
                     # Debug logging every 200 frames
                     if frame_count % 200 == 0:

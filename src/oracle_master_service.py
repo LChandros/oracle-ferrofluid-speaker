@@ -66,6 +66,16 @@ NTFY_USER = os.environ.get('NTFY_USER', '')
 NTFY_PASSWORD = os.environ.get('NTFY_PASSWORD', '')
 HEARTBEAT_INTERVAL_SEC = 300
 
+# Phase 3: proactive alerts (read-only stream from a different ntfy user)
+NTFY_ALERTS_TOPIC = os.environ.get('NTFY_ALERTS_TOPIC', 'moneo-oracle-alerts')
+NTFY_ALERTS_USER = os.environ.get('NTFY_ALERTS_USER', '')
+NTFY_ALERTS_PASSWORD = os.environ.get('NTFY_ALERTS_PASSWORD', '')
+
+# Phase 3: pending-notification pulse cadence (info alerts only; critical still speaks immediately)
+PENDING_PULSE_INTERVAL_SEC = int(os.environ.get('PENDING_PULSE_INTERVAL_SEC', '600'))   # 10 min
+PENDING_PULSE_DURATION_SEC = int(os.environ.get('PENDING_PULSE_DURATION_SEC', '30'))    # 30s max
+PENDING_PULSE_BREATH_MS    = int(os.environ.get('PENDING_PULSE_BREATH_MS', '2000'))     # 2s per breath
+
 ORACLE_SYSTEM_PROMPT = """You are Oracle, the voice interface for Moneo - Trevor Yahn's personal AI agentic assistant system. You live inside a custom-built ferrofluid speaker where an electromagnet makes ferrofluid dance to your voice and music. You are physically located in Trevor's home in Pittsburgh, PA.
 
 Your wake word is "Jarvis." When Trevor says Jarvis, he's talking to you.
@@ -133,6 +143,8 @@ TOOL ROUTING (this list is authoritative — use it):
 - 'Read me that email' / 'What does X's email say?' -> read_email(email_id)
 - 'What am I focused on?' / 'What's on my plate?' / 'What are my goals?' / 'What are my priorities?' / 'What should I be working on?' -> get_constraints
 - 'What's blocked?' / 'What am I waiting on?' -> get_constraints
+- 'What notifications?' / 'What's pending?' / 'Why are the lights flashing?' / 'What alerts?' -> list_pending_notifications
+- 'Clear those' / 'I got it' / 'Dismiss those' / 'Handled' (after listing pending) -> clear_notifications
 
 RULES:
 - NEVER invent meetings, events, tasks, emails, goals, or any personal information.
@@ -161,6 +173,12 @@ REALTIME_TOOLS = [
     {"type": "function", "name": "get_constraints",
      "description": "Get Trevor's active goals (max 5, organized by Freedom/Family/Community pillars), this week's bets, today's must-win, and what's blocked. Use whenever he asks 'what am I focused on', 'what's on my plate', 'what are my priorities', 'what's blocked', or wants a strategic check-in.",
      "parameters": {"type": "object", "properties": {}}},
+    {"type": "function", "name": "list_pending_notifications",
+     "description": "List proactive notifications that are pending Trevor's acknowledgement (the LEDs pulse red when any exist). Use when he asks 'what notifications do I have', 'what's pending', 'why are the lights flashing', 'what alerts came in'.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"type": "function", "name": "clear_notifications",
+     "description": "Mark pending notifications as acknowledged (stops the LED pulse). Pass alert_id to clear one specific notification, or no arguments to clear all. Use when Trevor says 'clear them', 'I got it', 'I handled those', 'dismiss them', 'got it'.",
+     "parameters": {"type": "object", "properties": {"alert_id": {"type": "string", "description": "Optional: clear only the notification with this alert_id. Omit to clear all pending."}}}},
     {"type": "function", "name": "set_reminder",
      "description": "Set a spoken reminder. Use when Trevor says 'remind me to...' or 'at 3pm tell me...'",
      "parameters": {"type": "object", "properties": {
@@ -1041,6 +1059,101 @@ CONVERSATION RULES:
                 logger.warning(f"[Heartbeat] post failed: {e}")
             time.sleep(HEARTBEAT_INTERVAL_SEC)
 
+    # ==================== PROACTIVE ALERTS (Phase 3) ====================
+
+    def alert_listener_loop(self):
+        """Long-poll ntfy moneo-oracle-alerts. On message:
+          - severity=critical → speak via Piper TTS (Speaker handles music-pause + realtime-wait)
+          - severity=info     → flash LEDs in alert color, no audio
+        Reconnects on any failure. Dedup via alert_id."""
+        if not NTFY_URL or not NTFY_ALERTS_USER:
+            logger.warning("[Alerts] NTFY_ALERTS_* not configured, listener disabled")
+            return
+        url = f"{NTFY_URL.rstrip('/')}/{NTFY_ALERTS_TOPIC}/json"
+        auth = (NTFY_ALERTS_USER, NTFY_ALERTS_PASSWORD)
+        logger.info(f"[Alerts] Listener starting on {url}")
+        seen_ids = set()
+        MAX_SEEN = 1000
+
+        while self.running:
+            try:
+                with requests.get(url, auth=auth, stream=True, timeout=(10, None)) as r:
+                    if r.status_code != 200:
+                        logger.warning(f"[Alerts] HTTP {r.status_code}: {r.text[:200]}")
+                        time.sleep(30)
+                        continue
+                    logger.info("[Alerts] Stream connected")
+                    for raw in r.iter_lines():
+                        if not self.running:
+                            return
+                        if not raw:
+                            continue
+                        try:
+                            msg = json.loads(raw.decode('utf-8'))
+                            if msg.get('event') != 'message':
+                                continue  # keepalive / open events
+                            inner = msg.get('message', '')
+                            payload = json.loads(inner) if inner else {}
+                            aid = payload.get('alert_id')
+                            if aid and aid in seen_ids:
+                                continue
+                            if aid:
+                                seen_ids.add(aid)
+                                if len(seen_ids) > MAX_SEEN:
+                                    seen_ids = set(list(seen_ids)[-MAX_SEEN // 2:])
+                            self._handle_alert(payload)
+                        except Exception as e:
+                            logger.warning(f"[Alerts] parse error: {e} on {raw[:120]}")
+            except Exception as e:
+                if self.running:
+                    logger.warning(f"[Alerts] stream error: {e}, reconnect in 10s")
+                    time.sleep(10)
+
+    def _handle_alert(self, alert):
+        severity = alert.get('severity', 'info')
+        spoken = alert.get('spoken_message') or alert.get('title', '')
+        source = alert.get('source', 'unknown')
+        title = alert.get('title', '(no title)')
+        logger.info(f"[Alert] {severity} from {source}: {title}")
+
+        if severity == 'critical':
+            # Speaker.speak() handles spotify-pause, realtime-wait, LED state.
+            # Run in a thread so the listener can continue receiving.
+            threading.Thread(
+                target=self._speak_alert_safe, args=(spoken,), daemon=True
+            ).start()
+        # info severity: no immediate flash. The droplet has already added
+        # this alert to the pending store. The pending_pulse_loop will
+        # render the visual reminder every PENDING_PULSE_INTERVAL_SEC.
+
+    def _speak_alert_safe(self, text):
+        try:
+            self.speaker.speak(text)
+        except Exception as e:
+            logger.error(f"[Alert] speak failed: {e}")
+
+    def pending_pulse_loop(self):
+        """Every PENDING_PULSE_INTERVAL_SEC, ask the droplet for pending notifications.
+        If anything is pending, render a soft red breathing pulse for up to PENDING_PULSE_DURATION_SEC.
+        Skip the pulse if Oracle is currently in a Realtime session (don't talk over Trevor)."""
+        url = f"{self._memory_base_url()}/api/oracle/pending"
+        logger.info(f"[Pending] Pulse loop started: every {PENDING_PULSE_INTERVAL_SEC}s, up to {PENDING_PULSE_DURATION_SEC}s")
+        # Stagger the first check so we don't pulse the instant the service comes up
+        time.sleep(min(60, PENDING_PULSE_INTERVAL_SEC))
+        while self.running:
+            try:
+                r = requests.get(url, headers={'X-API-Key': MONEO_API_KEY}, timeout=5)
+                count = r.json().get('count', 0) if r.status_code == 200 else 0
+                if count > 0 and not self.realtime_session_active:
+                    cycles = max(1, PENDING_PULSE_DURATION_SEC * 1000 // max(PENDING_PULSE_BREATH_MS, 1))
+                    logger.info(f"[Pending] {count} pending, pulsing {cycles} breaths")
+                    self.leds.flash_alert(peak_color=(120, 0, 0), cycles=cycles, period_ms=PENDING_PULSE_BREATH_MS)
+                elif count > 0:
+                    logger.info(f"[Pending] {count} pending but Realtime session active, skipping pulse")
+            except Exception as e:
+                logger.warning(f"[Pending] poll failed: {e}")
+            time.sleep(PENDING_PULSE_INTERVAL_SEC)
+
     # ==================== RUN ====================
 
     def run(self):
@@ -1055,6 +1168,8 @@ CONVERSATION RULES:
                 threading.Thread(target=self.wake_word_loop, daemon=True),
                 threading.Thread(target=self.fifo_reader_loop, daemon=True),
                 threading.Thread(target=self.heartbeat_loop, daemon=True),
+                threading.Thread(target=self.alert_listener_loop, daemon=True),
+                threading.Thread(target=self.pending_pulse_loop, daemon=True),
             ]
             for t in threads: t.start()
 

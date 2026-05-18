@@ -42,6 +42,10 @@ class ToolHandler:
             return self._read_email(args.get("email_id", ""))
         elif name == "get_constraints":
             return self._get_constraints()
+        elif name == "list_pending_notifications":
+            return self._list_pending_notifications()
+        elif name == "clear_notifications":
+            return self._clear_notifications(args.get("alert_id"))
         elif name == "set_reminder":
             return self._set_reminder(
                 args.get("message", ""),
@@ -186,6 +190,55 @@ class ToolHandler:
                 "body": body[:1500],  # Cap to keep TTS reasonable
                 "has_attachments": d.get("hasAttachments", False),
             }
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ==================== PENDING NOTIFICATIONS (Phase 3) ====================
+
+    def _list_pending_notifications(self):
+        """List all currently-pending info notifications waiting for acknowledgement."""
+        try:
+            api_base = self.moneo_api_url.rsplit('/api/', 1)[0]
+            response = requests.get(
+                f"{api_base}/api/oracle/pending",
+                headers={"X-API-Key": self.moneo_api_key},
+                timeout=8
+            )
+            if response.status_code != 200:
+                return {"error": f"Pending API returned {response.status_code}"}
+            data = response.json()
+            items = data.get("pending", [])
+            if not items:
+                return {"pending": [], "message": "Nothing pending."}
+            summary = [
+                {
+                    "id": p.get("id"),
+                    "source": p.get("source"),
+                    "title": p.get("title"),
+                    "message": p.get("message", ""),
+                }
+                for p in items
+            ]
+            return {"pending": summary, "count": len(summary)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _clear_notifications(self, alert_id=None):
+        """Clear pending notifications. If alert_id given, clear just that one; else clear all."""
+        try:
+            api_base = self.moneo_api_url.rsplit('/api/', 1)[0]
+            body = {"alert_id": alert_id} if alert_id else {}
+            response = requests.post(
+                f"{api_base}/api/oracle/pending/clear",
+                headers={"X-API-Key": self.moneo_api_key, "Content-Type": "application/json"},
+                json=body,
+                timeout=8
+            )
+            if response.status_code != 200:
+                return {"error": f"Clear API returned {response.status_code}"}
+            data = response.json()
+            cleared = data.get("cleared", 0)
+            return {"status": "cleared", "count": cleared}
         except Exception as e:
             return {"error": str(e)}
 
