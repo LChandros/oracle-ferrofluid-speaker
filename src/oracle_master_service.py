@@ -38,15 +38,33 @@ from oracle_tools import ToolHandler
 
 # ==================== CONFIGURATION ====================
 
-# Load from environment with fallbacks
+# Load from environment. Secrets MUST come from /etc/oracle/oracle.env via systemd.
+# No hardcoded fallbacks — missing keys fail loudly at startup.
 AUDIO_DEVICE = os.environ.get('ORACLE_AUDIO_DEVICE', 'plughw:4,0')
 SAMPLE_RATE = 16000
-PORCUPINE_KEY = os.environ.get('PORCUPINE_KEY', '')
 WAKE_WORD = ['computer']
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-MONEO_API_URL = os.environ.get('MONEO_API_URL', '')
-MONEO_API_KEY = os.environ.get('MONEO_API_KEY', '')
 PIPER_MODEL_PATH = os.environ.get('PIPER_MODEL_PATH', '/home/tyahn/en_US-lessac-medium.onnx')
+
+_REQUIRED_ENV = ['PORCUPINE_KEY', 'OPENAI_API_KEY', 'MONEO_API_URL', 'MONEO_API_KEY']
+_missing = [k for k in _REQUIRED_ENV if not os.environ.get(k)]
+if _missing:
+    sys.stderr.write(
+        f"FATAL: missing required env vars: {_missing}. "
+        f"Check /etc/oracle/oracle.env and systemd EnvironmentFile directive.\n"
+    )
+    sys.exit(1)
+
+PORCUPINE_KEY = os.environ['PORCUPINE_KEY']
+OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
+MONEO_API_URL = os.environ['MONEO_API_URL']
+MONEO_API_KEY = os.environ['MONEO_API_KEY']
+
+# Optional heartbeat config
+NTFY_URL = os.environ.get('NTFY_URL', '')
+NTFY_HEARTBEAT_TOPIC = os.environ.get('NTFY_HEARTBEAT_TOPIC', 'oracle-heartbeat')
+NTFY_USER = os.environ.get('NTFY_USER', '')
+NTFY_PASSWORD = os.environ.get('NTFY_PASSWORD', '')
+HEARTBEAT_INTERVAL_SEC = 300
 
 ORACLE_SYSTEM_PROMPT = """You are Oracle, the voice interface for Moneo - Trevor Yahn's personal AI agentic assistant system. You live inside a custom-built ferrofluid speaker where an electromagnet makes ferrofluid dance to your voice and music. You are physically located in Trevor's home in Pittsburgh, PA.
 
@@ -507,6 +525,22 @@ class OracleMasterService:
         )
         logger.info("[Mic] Unmuted")
 
+    def _ensure_mic_alive(self):
+        """Watchdog: respawn arecord if the subprocess has died.
+        Wake-word loop would otherwise spin on a closed pipe forever
+        (known reliability issue from March 2026 — see oracle-speaker-v2 memory)."""
+        proc = getattr(self, 'mic_proc', None)
+        if proc is None or proc.poll() is not None:
+            rc = proc.poll() if proc is not None else 'none'
+            logger.warning(f"[Mic Watchdog] arecord died (rc={rc}), respawning")
+            try:
+                self._unmute_mic()
+                return True
+            except Exception as e:
+                logger.error(f"[Mic Watchdog] respawn failed: {e}")
+                time.sleep(1)
+        return False
+
     # ==================== WAKE WORD ====================
 
     def wake_word_loop(self):
@@ -514,9 +548,12 @@ class OracleMasterService:
         logger.info(f"[Wake Word] Thread started - listening for '{WAKE_WORD[0].upper()}'")
         logger.info("[Wake Word] Entering read loop...")
         frame_count = 0
+        empty_read_streak = 0
+        MAX_EMPTY_READS = 100  # ~10s at 100ms sleep — forces respawn even if proc didn't exit
 
         while self.running:
             try:
+                self._ensure_mic_alive()
                 try:
                     mic_fd = self.mic_proc.stdout.fileno()
                 except (ValueError, AttributeError, OSError):
@@ -528,7 +565,15 @@ class OracleMasterService:
                     except OSError: chunk = b''
                     if not chunk: time.sleep(0.1); break
                     data += chunk
-                if len(data) < self.mic_frame_bytes: continue
+                if len(data) < self.mic_frame_bytes:
+                    empty_read_streak += 1
+                    if empty_read_streak >= MAX_EMPTY_READS:
+                        logger.warning(f"[Mic Watchdog] {empty_read_streak} empty reads, forcing mic respawn")
+                        self._mute_mic()
+                        self._unmute_mic()
+                        empty_read_streak = 0
+                    continue
+                empty_read_streak = 0
 
                 length = self.porcupine.frame_length
                 if length > 0:
@@ -905,6 +950,33 @@ CONVERSATION RULES:
             logger.error(traceback.format_exc())
             self.realtime_session_active = False
 
+    # ==================== HEARTBEAT ====================
+
+    def heartbeat_loop(self):
+        """Post a liveness heartbeat to ntfy every HEARTBEAT_INTERVAL_SEC.
+        Droplet-side dead-mans-switch pages if heartbeats stop for >2x interval."""
+        if not NTFY_URL:
+            logger.warning("[Heartbeat] NTFY_URL not set, heartbeat disabled")
+            return
+        url = f"{NTFY_URL.rstrip('/')}/{NTFY_HEARTBEAT_TOPIC}"
+        auth = (NTFY_USER, NTFY_PASSWORD) if NTFY_USER else None
+        logger.info(f"[Heartbeat] Started: posting to {url} every {HEARTBEAT_INTERVAL_SEC}s")
+        while self.running:
+            try:
+                payload = f"alive {datetime.now().isoformat(timespec='seconds')}"
+                r = requests.post(
+                    url,
+                    data=payload,
+                    headers={'Priority': '1', 'Tags': 'green_heart', 'Title': 'Oracle'},
+                    auth=auth,
+                    timeout=5,
+                )
+                if r.status_code >= 400:
+                    logger.warning(f"[Heartbeat] HTTP {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                logger.warning(f"[Heartbeat] post failed: {e}")
+            time.sleep(HEARTBEAT_INTERVAL_SEC)
+
     # ==================== RUN ====================
 
     def run(self):
@@ -918,6 +990,7 @@ CONVERSATION RULES:
                 threading.Thread(target=self.spotify.monitor_loop, args=(self,), daemon=True),
                 threading.Thread(target=self.wake_word_loop, daemon=True),
                 threading.Thread(target=self.fifo_reader_loop, daemon=True),
+                threading.Thread(target=self.heartbeat_loop, daemon=True),
             ]
             for t in threads: t.start()
 

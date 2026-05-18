@@ -8,6 +8,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/home/tyahn
+EnvironmentFile=/etc/oracle/oracle.env
 ExecStart=/usr/bin/python3 /home/tyahn/oracle_master_service.py
 Restart=always
 RestartSec=10
