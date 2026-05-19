@@ -17,8 +17,25 @@ TOPIC="moneo-oracle-heartbeat"
 STALE_THRESHOLD_SEC=900   # 15 min (heartbeat interval is 5 min, so allow 3 misses)
 STATE_FILE="/tmp/oracle-watchdog.state"
 
+# Quiet window — Oracle is intentionally powered down overnight to protect the PLA enclosure
+# from electromagnet heat. Don't page during these hours.
+ORACLE_QUIET_START_HOUR="${ORACLE_QUIET_START_HOUR:-21}"   # 9 PM ET
+ORACLE_QUIET_END_HOUR="${ORACLE_QUIET_END_HOUR:-7}"        # 7 AM ET
+
 now=$(date +%s)
 log() { echo "$(date -Iseconds) $*"; }
+
+# Skip during quiet hours (handles wrap-around midnight)
+hour_et=$(TZ=America/New_York date +%-H)
+if (( ORACLE_QUIET_START_HOUR < ORACLE_QUIET_END_HOUR )); then
+  in_quiet=$(( hour_et >= ORACLE_QUIET_START_HOUR && hour_et < ORACLE_QUIET_END_HOUR ))
+else
+  in_quiet=$(( hour_et >= ORACLE_QUIET_START_HOUR || hour_et < ORACLE_QUIET_END_HOUR ))
+fi
+if (( in_quiet )); then
+  log "quiet hours (${hour_et}:00 ET, window ${ORACLE_QUIET_START_HOUR}–${ORACLE_QUIET_END_HOUR}), skipping"
+  exit 0
+fi
 
 # Pull most-recent message
 latest_json=$(curl -fsS -u "${USER}:${PASS}" \
