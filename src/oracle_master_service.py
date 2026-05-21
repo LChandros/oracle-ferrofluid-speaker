@@ -1018,38 +1018,29 @@ RULES:
             self.realtime_session_active = False
 
     def _deliver_eod_checkin(self):
-        """Deliver the EOD check-in interview at 6 PM weekday. Slimmer than the morning
-        briefing — no pre-generated script, just opens a 3-question Realtime Q&A and
-        ships the transcript to /api/voice/checkin/extract with kind='eod' so the
-        droplet writes a daily debrief to vault/moneo/daily-debriefs/."""
+        """Run the end-of-day check-in. Fetches the task-walk prompt from Moneo
+        (/api/voice/eod/generate — today's task list embedded), runs the Realtime
+        interview, then posts the transcript to /api/voice/eod/reconcile so the
+        droplet marks completed tasks and creates new ones in the v3 system state."""
         logger.info("[EOD] Starting check-in...")
         try:
+            # 1. Fetch the EOD interview prompt with today's task list
+            api_base = MONEO_API_URL.rsplit('/api/', 1)[0]
+            logger.info("[EOD] Generating check-in prompt...")
+            gen_resp = requests.post(f"{api_base}/api/voice/eod/generate",
+                                     headers={"X-API-Key": MONEO_API_KEY}, timeout=30)
+            if gen_resp.status_code != 200:
+                logger.error(f"[EOD] Generate failed: {gen_resp.status_code}"); return
+            gen = gen_resp.json()
+            eod_prompt = gen.get("eodPrompt", "")
+            if not eod_prompt:
+                logger.error("[EOD] Empty prompt"); return
+            logger.info(f"[EOD] Walking {gen.get('taskCount', 0)} task(s)")
+
             self._spotify_was_playing = self.spotify.playing
             if self._spotify_was_playing: self.spotify.pause()
             play_chime(ascending=True)
             time.sleep(0.5)
-
-            eod_prompt = """You are Oracle, Trevor Yahn's AI assistant, delivering his end-of-day check-in over the speaker.
-
-Ask these three questions ONE AT A TIME, waiting for his response before moving on. Acknowledge briefly between them (one phrase like "Got it." or "Logged."). Do not ask follow-up questions unless he gives a one-word answer.
-
-1. What shipped today?
-2. What's blocked or stuck?
-3. What's tomorrow's number one?
-
-CAPTURE RULES (run these in parallel with the questions — your main job here):
-- Anything Trevor says is DONE/FINISHED/SHIPPED -> capture(type="complete")
-- Any blocker he names -> capture(type="note")
-- Tomorrow's #1 -> capture(type="commitment")
-- Any other actionable item that surfaces -> capture(type="task")
-Call capture without asking permission. Do NOT use dismiss_reminder for task completions.
-
-CONVERSATION RULES:
-- Keep responses to 1-2 sentences. Speaking out loud, not writing.
-- No motivational platitudes or summaries.
-- Be direct, JARVIS-style.
-- Start by saying "End of day check-in. What shipped today?"
-- After question 3, say "Logged. EOD complete. Talk in the morning." and end."""
 
             self.realtime_session_active = True
             self.leds.set_state("SPEAKING")
@@ -1075,23 +1066,24 @@ CONVERSATION RULES:
             self.current_session = None
             self.realtime_session_active = False
 
+            # Post-session: reconcile the transcript against the v3 task list
             if session.transcript:
-                logger.info(f"[EOD] Extracting captures from {len(session.transcript)} transcript entries")
+                logger.info(f"[EOD] Reconciling {len(session.transcript)} transcript entries")
                 try:
-                    api_base = MONEO_API_URL.rsplit('/api/', 1)[0]
-                    extract_resp = requests.post(
-                        f"{api_base}/api/voice/checkin/extract",
+                    reconcile_resp = requests.post(
+                        f"{api_base}/api/voice/eod/reconcile",
                         headers={"X-API-Key": MONEO_API_KEY, "Content-Type": "application/json"},
-                        json={"transcript": session.transcript, "kind": "eod"},
+                        json={"transcript": session.transcript},
                         timeout=30
                     )
-                    if extract_resp.status_code == 200:
-                        result = extract_resp.json()
-                        logger.info(f"[EOD] Captured {result.get('captured', 0)} items from check-in")
+                    if reconcile_resp.status_code == 200:
+                        result = reconcile_resp.json()
+                        logger.info(f"[EOD] Reconciled: {len(result.get('completed', []))} completed, "
+                                    f"{len(result.get('created', []))} new task(s)")
                     else:
-                        logger.error(f"[EOD] Extract failed: {extract_resp.status_code}")
+                        logger.error(f"[EOD] Reconcile failed: {reconcile_resp.status_code}")
                 except Exception as e:
-                    logger.error(f"[EOD] Extract error: {e}")
+                    logger.error(f"[EOD] Reconcile error: {e}")
 
             time.sleep(1)
             play_chime(ascending=False)
