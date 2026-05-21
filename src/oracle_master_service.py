@@ -867,10 +867,10 @@ If he doesn't say anything, the session will time out and that's fine.
     # ==================== BRIEFING SCHEDULER ====================
 
     def briefing_loop(self):
-        """Background thread: Deliver morning briefing at 10 AM and EOD check-in at 6 PM ET weekdays."""
+        """Background thread: Deliver morning briefing at 11 AM and EOD check-in at 6 PM ET weekdays."""
         delivered_today = False
         eod_delivered_today = False
-        logger.info("[Briefing] Scheduler started - morning 10:00 AM ET (weekdays); EOD auto-fire DISABLED, manual trigger only")
+        logger.info("[Briefing] Scheduler started - morning 11:00 AM ET (weekdays); EOD auto-fire DISABLED, manual trigger only")
 
         while self.running:
             try:
@@ -878,8 +878,8 @@ If he doesn't say anything, the session will time out and that's fine.
                 if now.hour == 0 and now.minute == 0:
                     delivered_today = False
                     eod_delivered_today = False
-                if now.hour == 10 and now.minute == 0 and now.weekday() < 5 and not delivered_today:
-                    logger.info("[Briefing] 10:00 AM ET - delivering morning briefing")
+                if now.hour == 11 and now.minute == 0 and now.weekday() < 5 and not delivered_today:
+                    logger.info("[Briefing] 11:00 AM ET - delivering morning briefing")
                     delivered_today = True
                     self._deliver_briefing()
                 # EOD auto-fire is DISABLED pending project-tracking redesign (2026-05-18).
@@ -897,6 +897,13 @@ If he doesn't say anything, the session will time out and that's fine.
                     except: pass
                     logger.info("[Briefing] Manual EOD trigger detected")
                     self._deliver_eod_checkin()
+                # External trigger via /tmp/oracle_briefing_trigger (touched by the
+                # dashboard "send now" button / triggerDelivery on the droplet).
+                if os.path.exists('/tmp/oracle_briefing_trigger'):
+                    try: os.remove('/tmp/oracle_briefing_trigger')
+                    except: pass
+                    logger.info("[Briefing] Manual briefing trigger detected")
+                    self._deliver_briefing()
                 time.sleep(30)
             except Exception as e:
                 logger.error(f"[Briefing] Error: {e}")
@@ -937,27 +944,19 @@ If he doesn't say anything, the session will time out and that's fine.
                 logger.info(f"[Briefing] Starting Q&A session with {len(interview_questions)} questions")
 
                 question_list = "\n".join(f"{i+1}. {q}" for i, q in enumerate(interview_questions))
-                qa_prompt = f"""You are Oracle, Trevor Yahn's AI assistant. You just delivered his morning briefing via the speaker. Now conduct a brief check-in.
+                qa_prompt = f"""You are Oracle, Trevor Yahn's AI assistant. You just delivered his morning briefing via the speaker. Now do a short check-in. This is a conversation, not data entry.
 
-Ask these questions ONE AT A TIME. Wait for Trevor's response before asking the next one:
+Ask Trevor these questions, ONE AT A TIME, waiting for his answer before asking the next:
 
 {question_list}
 
-CAPTURE RULES (CRITICAL — your main job during check-in):
-- When Trevor mentions something he needs to do: capture(type="task")
-- When Trevor commits to doing something today: capture(type="commitment")
-- When Trevor says something is DONE, FINISHED, or TAKEN CARE OF: capture(type="complete")
-- When Trevor shares a decision or context: capture(type="note")
-- Call capture for EVERY actionable thing Trevor says. Do not ask permission. Just save it and briefly confirm.
-- Do NOT use dismiss_reminder for task completions. Only use capture.
-
-CONVERSATION RULES:
-- Keep responses to 1-2 sentences. You are speaking out loud.
-- Do not repeat back what Trevor said unless confirming a capture.
-- Do not give motivational advice or platitudes.
-- Be direct and efficient like JARVIS.
-- Start by saying "That's your briefing. Let me check in on a few things."
-- After all questions, say a brief close-out and end."""
+RULES:
+- Do NOT call any tools. Do NOT call capture. This morning check-in does not create or complete tasks — the transcript is saved automatically afterward. Task review happens at the end-of-day check-in, not now.
+- Keep every response to one short sentence. You are speaking out loud.
+- Acknowledge briefly between questions ("Got it." / "Noted.").
+- Do not give advice or platitudes. Be direct, JARVIS-style.
+- Start by saying "That's your briefing. A couple quick things."
+- After his last answer, say "Logged. Go get it." and end."""
 
                 self.realtime_session_active = True
                 self.leds.set_state("SPEAKING")
@@ -975,6 +974,7 @@ CONVERSATION RULES:
                     memory_url=self._memory_base_url(),
                     memory_api_key=MONEO_API_KEY,
                     session_id=self.session_id,
+                    end_phrases=["go get it"],
                 )
                 self.current_session = session
                 session.start()
@@ -983,24 +983,25 @@ CONVERSATION RULES:
                 self.current_session = None
                 self.realtime_session_active = False
 
-                # Post-session: extract captures from transcript via Claude
+                # Post-session: save the morning interview as a day-context note
+                # (+ must-win). No task creation — that's the EOD check-in's job.
                 if session.transcript:
-                    logger.info(f"[Briefing] Extracting captures from {len(session.transcript)} transcript entries")
+                    logger.info(f"[Briefing] Saving morning interview ({len(session.transcript)} transcript entries)")
                     try:
                         api_base = MONEO_API_URL.rsplit('/api/', 1)[0]
-                        extract_resp = requests.post(
-                            f"{api_base}/api/voice/checkin/extract",
+                        dc_resp = requests.post(
+                            f"{api_base}/api/voice/daycontext",
                             headers={"X-API-Key": MONEO_API_KEY, "Content-Type": "application/json"},
                             json={"transcript": session.transcript},
                             timeout=30
                         )
-                        if extract_resp.status_code == 200:
-                            result = extract_resp.json()
-                            logger.info(f"[Briefing] Captured {result.get('captured', 0)} items from check-in")
+                        if dc_resp.status_code == 200:
+                            result = dc_resp.json()
+                            logger.info(f"[Briefing] Morning interview saved: {', '.join(result.get('actions', [])) or 'nothing captured'}")
                         else:
-                            logger.error(f"[Briefing] Extract failed: {extract_resp.status_code}")
+                            logger.error(f"[Briefing] Day-context save failed: {dc_resp.status_code}")
                     except Exception as e:
-                        logger.error(f"[Briefing] Extract error: {e}")
+                        logger.error(f"[Briefing] Day-context error: {e}")
 
             time.sleep(1)
             play_chime(ascending=False)
@@ -1066,6 +1067,7 @@ CONVERSATION RULES:
                 memory_url=self._memory_base_url(),
                 memory_api_key=MONEO_API_KEY,
                 session_id=self.session_id,
+                end_phrases=["talk in the morning"],
             )
             self.current_session = session
             session.start()

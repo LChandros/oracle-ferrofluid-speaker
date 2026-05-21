@@ -21,7 +21,7 @@ import requests
 logger = logging.getLogger('OracleRealtime')
 
 # Realtime API config
-REALTIME_MODEL = "gpt-4o-mini-realtime-preview-2024-12-17"
+REALTIME_MODEL = "gpt-realtime-mini"
 REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 REALTIME_VOICE = "echo"
 
@@ -73,7 +73,8 @@ class OracleRealtimeSession:
                  on_audio_started=None, on_response_done=None,
                  on_error=None, on_mic_mute=None, on_mic_unmute=None,
                  on_user_transcript=None, auto_start=False, session_timeout=20,
-                 memory_url=None, memory_api_key=None, session_id=None):
+                 memory_url=None, memory_api_key=None, session_id=None,
+                 end_phrases=None):
         self.api_key = api_key
         self.system_prompt = system_prompt
         self.tools = tools
@@ -89,6 +90,9 @@ class OracleRealtimeSession:
         self.auto_start = auto_start
         self.transcript = []  # Collected conversation transcript  # Called to restart mic after drain
         self.session_timeout = session_timeout
+        # If the assistant says any of these phrases, end the session as soon as
+        # its audio drains — instead of waiting out the inactivity timeout.
+        self.end_phrases = [p.lower() for p in (end_phrases or [])]
         # Phase 1: persistent cross-session memory
         self.memory_url = memory_url            # e.g. http://droplet:3002
         self.memory_api_key = memory_api_key
@@ -103,6 +107,7 @@ class OracleRealtimeSession:
         self._is_responding = False  # True while Oracle is speaking (mute mic to prevent echo)
         self._loop = None
         self._ws_ref = None
+        self._end_requested = False  # set when an end phrase is heard
 
     def start(self):
         """Start the session in a background thread."""
@@ -184,9 +189,9 @@ class OracleRealtimeSession:
 
     async def _async_session(self):
         """Main async session loop."""
+        # GA Realtime API — the beta API shape (OpenAI-Beta: realtime=v1) is retired.
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1"
+            "Authorization": f"Bearer {self.api_key}"
         }
 
         self._loop = asyncio.get_event_loop()
@@ -215,19 +220,26 @@ class OracleRealtimeSession:
                 session_config = {
                     "type": "session.update",
                     "session": {
+                        "type": "realtime",
                         "instructions": self.system_prompt + time_context,
-                        "voice": REALTIME_VOICE,
-                        "modalities": ["text", "audio"],
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.3,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 800
-                        },
-                        "input_audio_format": "pcm16",
-                        "output_audio_format": "pcm16",
-                        "input_audio_transcription": {
-                            "model": "whisper-1"
+                        "output_modalities": ["audio"],
+                        "audio": {
+                            "input": {
+                                "format": {"type": "audio/pcm", "rate": API_RATE},
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "threshold": 0.3,
+                                    "prefix_padding_ms": 300,
+                                    "silence_duration_ms": 800
+                                },
+                                "transcription": {
+                                    "model": "whisper-1"
+                                }
+                            },
+                            "output": {
+                                "format": {"type": "audio/pcm", "rate": API_RATE},
+                                "voice": REALTIME_VOICE
+                            }
                         }
                     }
                 }
@@ -317,7 +329,7 @@ class OracleRealtimeSession:
                 event = json.loads(msg_str)
                 etype = event.get("type", "")
 
-                if etype == "response.audio.delta":
+                if etype == "response.output_audio.delta":
                     # First audio chunk = mute mic, set SPEAKING state
                     if self._first_audio_in_response:
                         self._first_audio_in_response = False
@@ -353,12 +365,15 @@ class OracleRealtimeSession:
                         self.on_speech_ended()
                     self._last_activity = time.time()
 
-                elif etype == "response.audio_transcript.done":
+                elif etype == "response.output_audio_transcript.done":
                     transcript = event.get("transcript", "")
                     if transcript:
                         logger.info(f"[Realtime] Oracle: {transcript[:150]}")
                         self.transcript.append({"role": "oracle", "text": transcript})
                         self._log_turn_async("assistant", transcript)
+                        if self.end_phrases and any(p in transcript.lower() for p in self.end_phrases):
+                            logger.info("[Realtime] End phrase detected — will close after audio drains")
+                            self._end_requested = True
 
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     transcript = event.get("transcript", "")
@@ -448,6 +463,9 @@ class OracleRealtimeSession:
         self._is_responding = False
         self._last_activity = time.time()  # Reset timeout since we just finished speaking
         logger.info(f"[Realtime] Echo suppression lifted (flushed {flushed} chunks, 1.5s drain)")
+        if self._end_requested:
+            logger.info("[Realtime] Closing session — end phrase delivered")
+            self.active = False
 
     async def _check_timeout(self):
         """Close session after inactivity."""
