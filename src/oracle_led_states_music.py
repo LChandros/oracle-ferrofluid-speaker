@@ -34,12 +34,15 @@ SAMPLE_RATE = 44100  # Match Raspotify actual output
 CHUNK_SIZE = 1024
 
 # Electromagnet pattern parameters
+# RULE: the magnet may only be driven when real audio is coming OUT of the
+# speaker (SPEAKING / MUSIC). It is held at 0 otherwise so the coil cannot
+# overheat from a sustained or free-running duty cycle. No baseline holds.
 MAGNET_PARAMS = {
-    'IDLE': {'min_duty': 0, 'max_duty': 0},           # Completely off
-    'LISTENING': {'min_duty': 40, 'max_duty': 85},    # Gentle pulse
-    'THINKING': {'min_duty': 70, 'max_duty': 95},     # Chaotic movement (increased range)
-    'SPEAKING': {'min_duty': 80, 'max_duty': 95},     # Strong rhythmic (increased)
-    'MUSIC': {'min_duty': 50, 'max_duty': 100}        # Audio-reactive (35% baseline hold)
+    'IDLE': {'min_duty': 0, 'max_duty': 0},           # Off
+    'LISTENING': {'min_duty': 0, 'max_duty': 0},      # Off - no audio output
+    'THINKING': {'min_duty': 0, 'max_duty': 0},       # Off - no audio output
+    'SPEAKING': {'min_duty': 0, 'max_duty': 95},      # Audio-reactive only, 0 floor
+    'MUSIC': {'min_duty': 0, 'max_duty': 100}         # Audio-reactive only, 0 floor
 }
 
 # Audio analysis parameters (research-optimized)
@@ -180,9 +183,9 @@ class OracleLEDController:
         GPIO.output(MAGNET_PIN, GPIO.LOW)
 
     def _animate_listening(self):
-        """Listening state - blue pulse with gentle magnet sine wave"""
+        """Listening state - blue breathing pulse. Magnet OFF (no audio output)."""
         t = 0
-        params = MAGNET_PARAMS['LISTENING']
+        self.magnet_pwm.ChangeDutyCycle(0)  # no audio out of the speaker -> magnet off
 
         while self.running and self.current_state == 'LISTENING':
             # Smooth sine wave for breathing effect (slower breath)
@@ -193,19 +196,13 @@ class OracleLEDController:
                 self.strip.setPixelColor(i, Color(0, 0, brightness))
             self.strip.show()
 
-            # Electromagnet gentle sine wave
-            duty = params['min_duty'] + (params['max_duty'] - params['min_duty']) * \
-                   (0.5 + 0.5 * math.sin(t * 1.5 * math.pi))
-            self.magnet_pwm.ChangeDutyCycle(duty)
-
             t += 0.02
             time.sleep(0.02)
 
     def _animate_thinking(self):
-        """Thinking state - purple rotating with MORE chaotic magnet"""
+        """Thinking state - purple rotating LEDs. Magnet OFF (no audio output)."""
         pos = 0
-        t = 0
-        params = MAGNET_PARAMS['THINKING']
+        self.magnet_pwm.ChangeDutyCycle(0)  # no audio out of the speaker -> magnet off
 
         while self.running and self.current_state == 'THINKING':
             for i in range(LED_COUNT):
@@ -219,27 +216,19 @@ class OracleLEDController:
 
             self.strip.show()
 
-            # More chaotic electromagnet pattern
-            # Multiple overlapping sine waves + random noise
-            chaos1 = math.sin(t * 8) * 0.3
-            chaos2 = math.sin(t * 13.7) * 0.25
-            chaos3 = math.sin(t * 3.2) * 0.2
-            random_spike = random.uniform(-0.4, 0.4)
-            
-            duty_normalized = 0.5 + chaos1 + chaos2 + chaos3 + random_spike
-            duty_normalized = max(0, min(1, duty_normalized))
-            duty = min(100, params["min_duty"] + duty_normalized * (params["max_duty"] - params["min_duty"]))
-            self.magnet_pwm.ChangeDutyCycle(duty)
-
             pos = (pos + 1) % LED_COUNT
-            t += 0.04  # Faster timing
             time.sleep(0.04)
 
     def _animate_speaking(self):
-        """Speaking state - green waves with STRONGER magnet pulses mimicking speech"""
+        """Speaking state - green waves. Magnet driven ONLY by the real TTS
+        audio coming out of the speaker (RMS of the shared audio buffer).
+        Silence between words / no output => duty 0. No free-running pattern,
+        so the coil cannot heat up when Oracle is not actually speaking."""
         pos = 0
-        t = 0
         params = MAGNET_PARAMS['SPEAKING']
+        magnet_smoothed = 0.0
+        use_buffer = hasattr(self, 'audio_buffer') and self.audio_buffer is not None
+        self.magnet_pwm.ChangeDutyCycle(0)
 
         while self.running and self.current_state == 'SPEAKING':
             for i in range(LED_COUNT):
@@ -253,23 +242,27 @@ class OracleLEDController:
 
             self.strip.show()
 
-            # Electromagnet mimics speech patterns (MORE AGGRESSIVE)
-            if self.tts_audio_level > 0.01:
-                # Real TTS audio level
-                duty_normalized = self.tts_audio_level
-            else:
-                # Simulated speech pattern - faster, more varied
-                # Creates syllable-like bursts
-                syllable_pulse = (math.sin(t * 18) ** 2) * (math.sin(t * 6) ** 2)
-                burst_pattern = 1.0 if (t % 1.2) < 0.8 else 0.15  # Talk/pause pattern
-                emphasis = 1.0 + 0.3 * math.sin(t * 2.5)  # Emphasis variation
-                duty_normalized = syllable_pulse * burst_pattern * emphasis
+            # Magnet: driven ONLY by real audio measured at the speaker output.
+            # No audio in the buffer -> duty stays 0.
+            duty = 0.0
+            try:
+                if use_buffer and len(self.audio_buffer) > 0:
+                    length, data = self.audio_buffer.popleft()
+                    if length > 0:
+                        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                        rms = np.sqrt(np.mean(samples * samples)) / 32768.0
+                        level = min(1.0, rms * 4.0)  # speech RMS ~0.05-0.25 -> usable range
+                        duty = level * params['max_duty']
+            except Exception:
+                duty = 0.0
 
-            duty = min(100, params["min_duty"] + duty_normalized * (params["max_duty"] - params["min_duty"]))
-            self.magnet_pwm.ChangeDutyCycle(duty)
+            # Fast attack / quick release; collapses to a hard 0 on silence
+            magnet_smoothed = 0.4 * magnet_smoothed + 0.6 * duty
+            if magnet_smoothed < 1.0:
+                magnet_smoothed = 0.0
+            self.magnet_pwm.ChangeDutyCycle(magnet_smoothed)
 
             pos = (pos + 1) % LED_COUNT
-            t += 0.025  # Faster speech cadence
             time.sleep(0.025)
 
     def _animate_music(self):
@@ -373,9 +366,9 @@ class OracleLEDController:
                     if bass_level < 5:
                         bass_level = 0
 
-                    # Map bass level onto baseline hold range
-                    # min_duty = baseline that keeps ferrofluid elevated
-                    # Dynamic range rides on top of baseline
+                    # Map bass level straight onto duty cycle.
+                    # min_duty is 0 (no baseline hold) - quiet/stopped audio -> 0,
+                    # so the magnet is only energized by actual sound output.
                     params = MAGNET_PARAMS['MUSIC']
                     baseline = params['min_duty']
                     ceiling = params['max_duty']
@@ -458,20 +451,14 @@ class OracleLEDController:
             self.audio_stream = None
 
     def _animate_music_demo(self):
-        """Demo music visualization (enhanced)"""
+        """Demo music visualization (LED only).
+        Reached when real audio capture failed - we cannot measure the
+        speaker output, so the magnet stays at 0 (never driven blind)."""
         hue_offset = 0
         t = 0
+        self.magnet_pwm.ChangeDutyCycle(0)  # no measurable audio -> magnet off
 
         while self.running and self.current_state == 'MUSIC':
-            # Simulate bass with varied pattern
-            bass_sim = 40 + 50 * abs(math.sin(t * 2.5))
-            
-            # Simulate beats
-            if int(t * 2.5) % 4 == 0 and (t * 2.5) % 1 < 0.1:
-                bass_sim = min(100, bass_sim * 1.8)
-
-            self.magnet_pwm.ChangeDutyCycle(bass_sim)
-
             # LED demo
             intensity = int(127 + 128 * abs(math.sin(t * 2)))
             for i in range(LED_COUNT):
